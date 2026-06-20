@@ -17,11 +17,35 @@ def build_screener_query(query_type: str, query: dict[str, Any]) -> ScreenerQuer
     """Build a yfinance screener query object from a JSON-serializable query tree."""
     match query_type.lower():
         case "equity":
-            return _build_equity_node(query)
+            equity_query = _build_equity_node(query)
+            if not _has_region_constraint(query):
+                equity_query = EquityQuery("and", [equity_query, EquityQuery("eq", ["region", "us"])])
+            return equity_query
         case "fund":
             return _build_fund_node(query)
         case _:
             raise ValueError("query_type must be 'equity' or 'fund' for custom queries")
+
+
+def _has_region_constraint(node: dict[str, Any]) -> bool:
+    """Check whether a query tree already constrains the 'region' field.
+
+    Without this check, custom equity screens default to every Yahoo region (US, Korea,
+    Hong Kong, China, Japan, Europe, ...), so USD-denominated thresholds like market cap
+    get compared against local-currency values and become meaningless.
+    """
+    if not isinstance(node, dict):
+        return False
+
+    operator = node.get("operator")
+    operands = node.get("operands")
+    if not isinstance(operator, str) or not isinstance(operands, list):
+        return False
+
+    if operator.lower() in LOGICAL_OPERATORS:
+        return any(_has_region_constraint(operand) for operand in operands)
+
+    return bool(operands) and operands[0] == "region"
 
 
 def _validate_node_shape(node: dict[str, Any]) -> tuple[Operator, list[Any]]:

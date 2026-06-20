@@ -658,7 +658,7 @@ async def get_top_companies(
             details={"sector": sector},
         )
 
-    return dump_json(df.head(top_n).to_dict(orient="records"))
+    return dump_json(df.head(top_n).reset_index().to_dict(orient="records"))
 
 
 def _sector_key(name: str) -> str:
@@ -710,7 +710,7 @@ async def get_top_growth_companies(
         results.append(
             {
                 "industry": industry_name,
-                "top_growth_companies": df.head(top_n).to_dict(orient="records"),
+                "top_growth_companies": df.head(top_n).reset_index().to_dict(orient="records"),
             }
         )
 
@@ -759,7 +759,7 @@ async def get_top_performing_companies(
         results.append(
             {
                 "industry": industry_name,
-                "top_performing_companies": df.head(top_n).to_dict(orient="records"),
+                "top_performing_companies": df.head(top_n).reset_index().to_dict(orient="records"),
             }
         )
 
