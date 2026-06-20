@@ -22,6 +22,10 @@ from yfmcp.auth import SharedSecretOAuthProvider
 from yfmcp.chart import generate_chart
 from yfmcp.screener import build_screener_query
 from yfmcp.screener import filter_us_currency_quotes
+from yfmcp.screener import truncate_quotes
+
+_EQUITY_FILTER_OVERFETCH_FACTOR = 4
+_YAHOO_SCREENER_MAX_SIZE = 250
 from yfmcp.types import ChartType
 from yfmcp.types import Interval
 from yfmcp.types import OptionChainType
@@ -449,11 +453,15 @@ async def screen(
 
             resolved_query = build_screener_query(query_type=query_type, query=query)
 
+        fetch_size = size
+        if query_type == "equity" and size is not None:
+            fetch_size = min(size * _EQUITY_FILTER_OVERFETCH_FACTOR, _YAHOO_SCREENER_MAX_SIZE)
+
         result = await asyncio.to_thread(
             yf.screen,
             resolved_query,
             offset=offset,
-            size=size,
+            size=fetch_size,
             count=count,
             sortField=sort_field,
             sortAsc=sort_asc,
@@ -477,6 +485,8 @@ async def screen(
 
     if query_type == "equity":
         result = filter_us_currency_quotes(result)
+        if size is not None:
+            result = truncate_quotes(result, size)
 
     return dump_json(result)
 
@@ -538,11 +548,12 @@ async def screen_gappers(
 
     try:
         resolved_query = build_screener_query(query_type="equity", query=query)
+        fetch_size = min(size * _EQUITY_FILTER_OVERFETCH_FACTOR, _YAHOO_SCREENER_MAX_SIZE)
         result = await asyncio.to_thread(
             yf.screen,
             resolved_query,
             offset=offset,
-            size=size,
+            size=fetch_size,
             sortField="percentchange",
             sortAsc=sort_asc,
         )
@@ -562,6 +573,7 @@ async def screen_gappers(
         )
 
     result = filter_us_currency_quotes(result)
+    result = truncate_quotes(result, size)
 
     return dump_json(result)
 
@@ -684,19 +696,32 @@ def _industry_key(name: str) -> str:
 _INDUSTRY_FETCH_CONCURRENCY = asyncio.Semaphore(4)
 
 
-async def _fetch_industry_table(industry_name: str, attr: str) -> Any:
+async def _fetch_industry_table(industry_name: str, attr: str, expected_sector_key: str) -> Any:
     """Fetch a per-industry table with one retry, since sectors with many industries
 
     (e.g. Industrials has 25) fan out into many Yahoo calls, and a single slow/rate-limited
     call used to stall the whole tool past the MCP client's timeout. Concurrency is capped
     via a semaphore rather than firing all requests at once, to avoid bursting Yahoo's
     unofficial, undocumented endpoint and risking IP throttling/blocking.
+
+    Also verifies the fetched industry actually belongs to the requested sector before
+    returning its table, as a guard against returning data for the wrong sector.
     """
     async with _INDUSTRY_FETCH_CONCURRENCY:
         for attempt in range(2):
             try:
                 industry = await asyncio.to_thread(yf.Industry, _industry_key(industry_name))
-                return await asyncio.to_thread(lambda: getattr(industry, attr))
+                table = await asyncio.to_thread(lambda: getattr(industry, attr))
+                sector_key = await asyncio.to_thread(lambda: industry.sector_key)
+                if sector_key != expected_sector_key:
+                    logger.warning(
+                        "Industry '{}' returned sector_key '{}', expected '{}'; skipping.",
+                        industry_name,
+                        sector_key,
+                        expected_sector_key,
+                    )
+                    return None
+                return table
             except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
                 if attempt == 0:
                     await asyncio.sleep(0.5)
@@ -729,8 +754,12 @@ async def get_top_growth_companies(
             details={"sector": sector, "valid_sectors": list(SECTOR_INDUSTY_MAPPING.keys())},
         )
 
+    expected_sector_key = _sector_key(sector)
     tables = await asyncio.gather(
-        *(_fetch_industry_table(industry_name, "top_growth_companies") for industry_name in industries)
+        *(
+            _fetch_industry_table(industry_name, "top_growth_companies", expected_sector_key)
+            for industry_name in industries
+        )
     )
 
     results = []
@@ -775,8 +804,12 @@ async def get_top_performing_companies(
             details={"sector": sector, "valid_sectors": list(SECTOR_INDUSTY_MAPPING.keys())},
         )
 
+    expected_sector_key = _sector_key(sector)
     tables = await asyncio.gather(
-        *(_fetch_industry_table(industry_name, "top_performing_companies") for industry_name in industries)
+        *(
+            _fetch_industry_table(industry_name, "top_performing_companies", expected_sector_key)
+            for industry_name in industries
+        )
     )
 
     results = []

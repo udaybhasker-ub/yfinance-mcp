@@ -527,6 +527,7 @@ async def test_get_top_growth_companies_success(mock_to_thread: AsyncMock, mock_
         }
     )
     mock_industry_obj.top_growth_companies = mock_df
+    mock_industry_obj.sector_key = "technology"
 
     async def mock_thread_func(func, *args):
         if callable(func):
@@ -565,6 +566,7 @@ async def test_get_top_growth_companies_loads_industries_by_api_key(
             "growth": [50.0],
         }
     )
+    mock_industry_obj.sector_key = "technology"
 
     async def mock_thread_func(func, *args):
         if callable(func):
@@ -613,6 +615,7 @@ async def test_get_top_performing_companies_success(mock_to_thread: AsyncMock, m
         }
     )
     mock_industry_obj.top_performing_companies = mock_df
+    mock_industry_obj.sector_key = "technology"
 
     async def mock_thread_func(func, *args):
         if callable(func):

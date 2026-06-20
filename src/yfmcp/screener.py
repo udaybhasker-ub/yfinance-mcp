@@ -59,6 +59,21 @@ def filter_us_currency_quotes(result: dict[str, Any]) -> dict[str, Any]:
     return {**result, "quotes": filtered, "count": len(filtered)}
 
 
+def truncate_quotes(result: dict[str, Any], limit: int) -> dict[str, Any]:
+    """Trim a screen result's quotes to at most `limit` entries, after client-side filtering.
+
+    Used together with an overfetch from Yahoo (asking for more rows than the caller
+    requested) so that dropping non-USD/duplicate ADRs in filter_us_currency_quotes doesn't
+    silently return fewer rows than the caller's requested size.
+    """
+    quotes = result.get("quotes")
+    if not isinstance(quotes, list):
+        return result
+
+    trimmed = quotes[:limit]
+    return {**result, "quotes": trimmed, "count": len(trimmed)}
+
+
 def _has_region_constraint(node: dict[str, Any]) -> bool:
     """Check whether a query tree already constrains the 'region' field.
 
