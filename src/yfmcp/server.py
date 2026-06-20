@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 from typing import Any
 
@@ -9,6 +10,7 @@ from loguru import logger
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
+from mcp.types import Icon
 from mcp.types import ImageContent
 from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
@@ -30,15 +32,15 @@ from yfmcp.types import TopType
 from yfmcp.utils import create_error_response
 from yfmcp.utils import dump_json
 
+_base_url = os.environ.get("MCP_PUBLIC_URL") or f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')}"
+
 # MCP_AUTH_SECRET gates the OAuth login form in yfmcp.auth, letting this server be added
 # as an authenticated connector (e.g. in Claude) instead of being open to anyone with the URL.
 _auth_secret = os.environ.get("MCP_AUTH_SECRET")
 _auth_provider = None
 _auth_settings = None
 if _auth_secret:
-    _public_url = AnyHttpUrl(
-        os.environ.get("MCP_PUBLIC_URL") or f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')}"
-    )
+    _public_url = AnyHttpUrl(_base_url)
     _auth_provider = SharedSecretOAuthProvider(_auth_secret)
     _auth_settings = AuthSettings(
         issuer_url=_public_url,
@@ -52,6 +54,7 @@ mcp = FastMCP(
     log_level="ERROR",
     auth_server_provider=_auth_provider,
     auth=_auth_settings,
+    icons=[Icon(src=f"{_base_url}/favicon.png", mimeType="image/png", sizes=["256x256"])],
 )
 
 
@@ -68,6 +71,23 @@ async def health_check(request: Any) -> Any:
     from starlette.responses import JSONResponse
 
     return JSONResponse({"status": "ok", "service": "yfinance-mcp"})
+
+
+_ASSETS_DIR = Path(__file__).parent / "assets"
+
+
+@mcp.custom_route("/favicon.ico", methods=["GET"], name="favicon_ico", include_in_schema=False)
+async def favicon_ico(request: Any) -> Any:
+    from starlette.responses import FileResponse
+
+    return FileResponse(_ASSETS_DIR / "favicon.ico", media_type="image/x-icon")
+
+
+@mcp.custom_route("/favicon.png", methods=["GET"], name="favicon_png", include_in_schema=False)
+async def favicon_png(request: Any) -> Any:
+    from starlette.responses import FileResponse
+
+    return FileResponse(_ASSETS_DIR / "favicon.png", media_type="image/png")
 
 
 _RETRYABLE_YFINANCE_EXCEPTIONS: tuple[type[Exception], ...] = (
