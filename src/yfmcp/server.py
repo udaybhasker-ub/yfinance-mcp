@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import inspect
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -119,8 +120,16 @@ async def _run_yf(func, *args, **kwargs):
         return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=_YF_CALL_TIMEOUT_SECONDS)
 
 
+def _format_call_params(func, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    try:
+        bound = inspect.signature(func).bind(*args, **kwargs)
+    except TypeError:
+        return str(kwargs or args)
+    return ", ".join(f"{name}={value!r}" for name, value in bound.arguments.items())
+
+
 def _logged_tool(func):
-    """Log every tool invocation's outcome and duration.
+    """Log every tool invocation's params, outcome, and duration.
 
     Without this, only the warning/error paths inside individual tools ever logged
     anything, so successful calls (the vast majority) were invisible in Railway logs.
@@ -129,19 +138,34 @@ def _logged_tool(func):
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
+        params = _format_call_params(func, args, kwargs)
         start = time.monotonic()
         try:
             result = await func(*args, **kwargs)
         except asyncio.CancelledError:
-            logger.warning("tool={} status=suspended duration={:.2f}s", tool_name, time.monotonic() - start)
+            logger.warning(
+                "tool={} params=({}) status=suspended duration={:.2f}s",
+                tool_name,
+                params,
+                time.monotonic() - start,
+            )
             raise
         except Exception as exc:
             logger.error(
-                "tool={} status=failed duration={:.2f}s error={}", tool_name, time.monotonic() - start, exc
+                "tool={} params=({}) status=failed duration={:.2f}s error={}",
+                tool_name,
+                params,
+                time.monotonic() - start,
+                exc,
             )
             raise
         else:
-            logger.info("tool={} status=success duration={:.2f}s", tool_name, time.monotonic() - start)
+            logger.info(
+                "tool={} params=({}) status=success duration={:.2f}s",
+                tool_name,
+                params,
+                time.monotonic() - start,
+            )
             return result
 
     return wrapper
