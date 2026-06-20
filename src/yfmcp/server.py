@@ -1,17 +1,22 @@
 import asyncio
+import os
 from datetime import datetime
 from typing import Annotated
 from typing import Any
 
 import yfinance as yf
 from loguru import logger
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent
 from mcp.types import ToolAnnotations
+from pydantic import AnyHttpUrl
 from pydantic import Field
 from yfinance.const import SECTOR_INDUSTY_MAPPING
 from yfinance.exceptions import YFRateLimitError
 
+from yfmcp.auth import SharedSecretOAuthProvider
 from yfmcp.chart import generate_chart
 from yfmcp.screener import build_screener_query
 from yfmcp.types import ChartType
@@ -25,14 +30,43 @@ from yfmcp.types import TopType
 from yfmcp.utils import create_error_response
 from yfmcp.utils import dump_json
 
+# MCP_AUTH_SECRET gates the OAuth login form in yfmcp.auth, letting this server be added
+# as an authenticated connector (e.g. in Claude) instead of being open to anyone with the URL.
+_auth_secret = os.environ.get("MCP_AUTH_SECRET")
+_auth_provider = None
+_auth_settings = None
+if _auth_secret:
+    _public_url = AnyHttpUrl(
+        os.environ.get("MCP_PUBLIC_URL") or f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')}"
+    )
+    _auth_provider = SharedSecretOAuthProvider(_auth_secret)
+    _auth_settings = AuthSettings(
+        issuer_url=_public_url,
+        resource_server_url=_public_url,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    )
+
 # https://github.com/jlowin/fastmcp/issues/81#issuecomment-2714245145
-mcp = FastMCP("yfinance_mcp", log_level="ERROR")
+mcp = FastMCP(
+    "yfinance_mcp",
+    log_level="ERROR",
+    auth_server_provider=_auth_provider,
+    auth=_auth_settings,
+)
+
+
+if _auth_provider is not None:
+
+    @mcp.custom_route("/login", methods=["GET", "POST"], name="login", include_in_schema=False)
+    async def login(request: Any) -> Any:
+        return await _auth_provider.handle_login(request)
 
 
 @mcp.custom_route("/health", methods=["GET"], name="health", include_in_schema=False)
 async def health_check(request: Any) -> Any:
     """Health check endpoint for Railway and other platforms."""
     from starlette.responses import JSONResponse
+
     return JSONResponse({"status": "ok", "service": "yfinance-mcp"})
 
 
@@ -1414,7 +1448,9 @@ async def get_earnings(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'NVDA')")],
     history_limit: Annotated[
         int,
-        Field(description="Number of past/future earnings dates to return (max 100). Default 12 = ~3 years.", ge=1, le=100),
+        Field(
+            description="Number of past/future earnings dates to return (max 100). Default 12 = ~3 years.", ge=1, le=100
+        ),
     ] = 12,
 ) -> str:
     """Fetch earnings beat/miss history, forward EPS/revenue estimates, and EPS revision trends.
