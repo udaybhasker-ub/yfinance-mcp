@@ -17,7 +17,7 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-COPY --from=uv --chown=app:app /app/.venv /app/.venv
+COPY --from=uv /app/.venv /app/.venv
 
 ENV PATH="/app/.venv/bin:$PATH"
 
