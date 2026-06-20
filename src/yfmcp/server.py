@@ -2,6 +2,7 @@ import asyncio
 import functools
 import inspect
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -40,6 +41,9 @@ from yfmcp.types import Sector
 from yfmcp.types import TopType
 from yfmcp.utils import create_error_response
 from yfmcp.utils import dump_json
+
+logger.remove()
+logger.add(sys.stderr, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
 
 _base_url = os.environ.get("MCP_PUBLIC_URL") or f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')}"
 
