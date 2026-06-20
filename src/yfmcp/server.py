@@ -115,9 +115,34 @@ _YF_CALL_CONCURRENCY = asyncio.Semaphore(4)
 _YF_CALL_TIMEOUT_SECONDS = 30.0
 
 
+def _describe_yf_call(func, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    name = getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or repr(func)
+    parts = [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
+    return f"{name}({', '.join(parts)})" if parts else name
+
+
 async def _run_yf(func, *args, **kwargs):
+    call_desc = _describe_yf_call(func, args, kwargs)
     async with _YF_CALL_CONCURRENCY:
-        return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=_YF_CALL_TIMEOUT_SECONDS)
+        start = time.monotonic()
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=_YF_CALL_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.error(
+                "yahoo_call={} status=failed duration={:.2f}s error={}: {}",
+                call_desc,
+                time.monotonic() - start,
+                type(exc).__name__,
+                exc,
+            )
+            raise
+        else:
+            logger.info(
+                "yahoo_call={} status=success duration={:.2f}s",
+                call_desc,
+                time.monotonic() - start,
+            )
+            return result
 
 
 def _format_call_params(func, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
