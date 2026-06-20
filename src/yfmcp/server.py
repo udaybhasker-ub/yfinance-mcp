@@ -1168,7 +1168,9 @@ async def get_price_history(
     if chart_type is None:
         return df.to_markdown()
 
-    return generate_chart(symbol=symbol, df=df, chart_type=chart_type)
+    # generate_chart does matplotlib rendering + WebP encoding, which is CPU-bound and slow
+    # enough to block the event loop for every other concurrent request if run inline.
+    return await asyncio.to_thread(generate_chart, symbol=symbol, df=df, chart_type=chart_type)
 
 
 @mcp.tool(
