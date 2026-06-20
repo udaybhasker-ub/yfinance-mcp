@@ -103,6 +103,19 @@ _RETRYABLE_YFINANCE_EXCEPTIONS: tuple[type[Exception], ...] = (
     YFRateLimitError,
 )
 
+# yfinance's YfData is a process-wide singleton: every Ticker/Search/Sector call shares one
+# curl_cffi session and cookie/crumb lock across all threads. Firing many concurrent tool
+# calls at it causes them to serialize on that shared session and choke each other rather
+# than running as independent requests. Cap how many run at once and bound each with a
+# timeout so a stalled call fails fast instead of hanging the MCP client.
+_YF_CALL_CONCURRENCY = asyncio.Semaphore(4)
+_YF_CALL_TIMEOUT_SECONDS = 30.0
+
+
+async def _run_yf(func, *args, **kwargs):
+    async with _YF_CALL_CONCURRENCY:
+        return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=_YF_CALL_TIMEOUT_SECONDS)
+
 
 def _is_retryable_yfinance_error(exc: BaseException) -> bool:
     return isinstance(exc, _RETRYABLE_YFINANCE_EXCEPTIONS)
@@ -211,8 +224,8 @@ async def get_ticker_info(
     Note: Available fields vary by security type. Timestamps are converted to readable dates.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
-        info = await asyncio.to_thread(lambda: ticker.info)
+        ticker = await _run_yf(yf.Ticker, symbol)
+        info = await _run_yf(lambda: ticker.info)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching ticker info for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -276,8 +289,8 @@ async def get_ticker_news(
     Use this to track company announcements, market sentiment, and breaking news.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
-        news = await asyncio.to_thread(ticker.get_news)
+        ticker = await _run_yf(yf.Ticker, symbol)
+        news = await _run_yf(ticker.get_news)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching news for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -343,7 +356,7 @@ async def search(
     Use this to find ticker symbols, discover related securities, or search financial news.
     """
     try:
-        s = await asyncio.to_thread(yf.Search, query)
+        s = await _run_yf(yf.Search, query)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"searching for '{query}'", exc, {"query": query})
     except Exception as exc:
@@ -458,7 +471,7 @@ async def screen(
         if query_type == "equity" and size is not None:
             fetch_size = min(size * _EQUITY_FILTER_OVERFETCH_FACTOR, _YAHOO_SCREENER_MAX_SIZE)
 
-        result = await asyncio.to_thread(
+        result = await _run_yf(
             yf.screen,
             resolved_query,
             offset=offset,
@@ -550,7 +563,7 @@ async def screen_gappers(
     try:
         resolved_query = build_screener_query(query_type="equity", query=query)
         fetch_size = min(size * _EQUITY_FILTER_OVERFETCH_FACTOR, _YAHOO_SCREENER_MAX_SIZE)
-        result = await asyncio.to_thread(
+        result = await _run_yf(
             yf.screen,
             resolved_query,
             offset=offset,
@@ -590,8 +603,8 @@ async def get_top_etfs(
     - name: Full ETF name
     """
     try:
-        s = await asyncio.to_thread(yf.Sector, _sector_key(sector))
-        etfs = await asyncio.to_thread(lambda: s.top_etfs)
+        s = await _run_yf(yf.Sector, _sector_key(sector))
+        etfs = await _run_yf(lambda: s.top_etfs)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching top ETFs for '{sector}'", exc, {"sector": sector})
     except Exception as exc:
@@ -623,8 +636,8 @@ async def get_top_mutual_funds(
     - name: Full fund name
     """
     try:
-        s = await asyncio.to_thread(yf.Sector, _sector_key(sector))
-        funds = await asyncio.to_thread(lambda: s.top_mutual_funds)
+        s = await _run_yf(yf.Sector, _sector_key(sector))
+        funds = await _run_yf(lambda: s.top_mutual_funds)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(
             f"fetching top mutual funds for '{sector}'",
@@ -659,8 +672,8 @@ async def get_top_companies(
     Typically includes company identifiers, market metrics, and analyst information.
     """
     try:
-        s = await asyncio.to_thread(yf.Sector, _sector_key(sector))
-        df = await asyncio.to_thread(lambda: s.top_companies)
+        s = await _run_yf(yf.Sector, _sector_key(sector))
+        df = await _run_yf(lambda: s.top_companies)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching top companies for '{sector}'", exc, {"sector": sector})
     except Exception as exc:
@@ -1024,8 +1037,8 @@ async def get_price_history(
     only work with short periods (1d, 5d).
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
-        df = await asyncio.to_thread(
+        ticker = await _run_yf(yf.Ticker, symbol)
+        df = await _run_yf(
             ticker.history,
             period=period,
             interval=interval,
@@ -1096,7 +1109,7 @@ async def get_financials(
     Use the data to analyze trends, calculate ratios, or compare periods.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await _run_yf(yf.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching financials for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -1119,15 +1132,15 @@ async def get_financials(
 
     try:
         if frequency == "annual":
-            income_stmt = await asyncio.to_thread(lambda: ticker.income_stmt)
-            balance_sheet = await asyncio.to_thread(lambda: ticker.balance_sheet)
-            cash_flow = await asyncio.to_thread(lambda: ticker.cashflow)
+            income_stmt = await _run_yf(lambda: ticker.income_stmt)
+            balance_sheet = await _run_yf(lambda: ticker.balance_sheet)
+            cash_flow = await _run_yf(lambda: ticker.cashflow)
         elif frequency == "quarterly":
-            income_stmt = await asyncio.to_thread(lambda: ticker.quarterly_income_stmt)
-            balance_sheet = await asyncio.to_thread(lambda: ticker.quarterly_balance_sheet)
-            cash_flow = await asyncio.to_thread(lambda: ticker.quarterly_cashflow)
+            income_stmt = await _run_yf(lambda: ticker.quarterly_income_stmt)
+            balance_sheet = await _run_yf(lambda: ticker.quarterly_balance_sheet)
+            cash_flow = await _run_yf(lambda: ticker.quarterly_cashflow)
         else:
-            income_stmt = await asyncio.to_thread(lambda: ticker.ttm_income_stmt)
+            income_stmt = await _run_yf(lambda: ticker.ttm_income_stmt)
             balance_sheet = None  # TTM balance sheet not directly available
             cash_flow = None  # TTM cash flow not directly available
 
@@ -1220,7 +1233,7 @@ async def _fetch_option_chain_for_date(
     option_type: OptionChainType,
 ) -> dict[str, Any]:
     """Fetch option chain for a single expiration date."""
-    opt = await asyncio.to_thread(lambda d=date: ticker.option_chain(d))
+    opt = await _run_yf(lambda d=date: ticker.option_chain(d))
 
     calls_df = opt.calls
     puts_df = opt.puts
@@ -1284,7 +1297,7 @@ async def get_option_chain(
     Use this to analyze options pricing, IV surfaces, and strike levels.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await _run_yf(yf.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching options for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -1295,7 +1308,7 @@ async def get_option_chain(
         )
 
     try:
-        available_dates = await asyncio.to_thread(lambda: ticker.options)
+        available_dates = await _run_yf(lambda: ticker.options)
     except Exception as exc:
         return _create_option_dates_fetch_error(
             symbol,
@@ -1368,8 +1381,8 @@ async def get_option_dates(
     the options chain for a specific date.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
-        dates = await asyncio.to_thread(lambda: ticker.options)
+        ticker = await _run_yf(yf.Ticker, symbol)
+        dates = await _run_yf(lambda: ticker.options)
     except Exception as exc:
         return _create_option_dates_fetch_error(
             symbol,
@@ -1400,7 +1413,7 @@ async def _fetch_holder_section(
 ) -> None:
     """Fetch a single holder data section, adding successful data to result and failures to fetch_errors."""
     try:
-        df = await asyncio.to_thread(lambda t=ticker: getattr(t, attr_name))
+        df = await _run_yf(lambda t=ticker: getattr(t, attr_name))
     except Exception as exc:
         logger.warning("Failed to fetch {} for {}: {}", attr_name, symbol, exc)
         fetch_errors.append(exc)
@@ -1459,7 +1472,7 @@ async def get_holders(
         )
 
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await _run_yf(yf.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching holders for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -1591,7 +1604,7 @@ async def get_earnings(
     - eps_revisions: Count of upward/downward analyst EPS revisions over last 7 and 30 days.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await _run_yf(yf.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching earnings for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -1605,7 +1618,7 @@ async def get_earnings(
 
     # Historical beat/miss + upcoming dates
     try:
-        dates_df = await asyncio.to_thread(ticker.get_earnings_dates, history_limit)
+        dates_df = await _run_yf(ticker.get_earnings_dates, history_limit)
         if dates_df is not None and not dates_df.empty:
             dates_df = dates_df.copy()
             dates_df.index = dates_df.index.strftime("%Y-%m-%d %H:%M %Z")
@@ -1615,7 +1628,7 @@ async def get_earnings(
 
     # Forward EPS estimates (0q, +1q, 0y, +1y)
     try:
-        ee = await asyncio.to_thread(ticker.get_earnings_estimate, True)
+        ee = await _run_yf(ticker.get_earnings_estimate, True)
         if ee:
             result["earnings_estimate"] = ee
     except Exception as exc:
@@ -1623,7 +1636,7 @@ async def get_earnings(
 
     # Forward revenue estimates
     try:
-        re = await asyncio.to_thread(ticker.get_revenue_estimate, True)
+        re = await _run_yf(ticker.get_revenue_estimate, True)
         if re:
             result["revenue_estimate"] = re
     except Exception as exc:
@@ -1631,7 +1644,7 @@ async def get_earnings(
 
     # EPS trend vs 7/30/60/90 days ago
     try:
-        et = await asyncio.to_thread(ticker.get_eps_trend, True)
+        et = await _run_yf(ticker.get_eps_trend, True)
         if et:
             result["eps_trend"] = et
     except Exception as exc:
@@ -1639,7 +1652,7 @@ async def get_earnings(
 
     # Revision counts (up/down last 7d and 30d)
     try:
-        er = await asyncio.to_thread(ticker.get_eps_revisions, True)
+        er = await _run_yf(ticker.get_eps_revisions, True)
         if er:
             result["eps_revisions"] = er
     except Exception as exc:
@@ -1681,7 +1694,7 @@ async def get_analyst(
       toGrade, and action (up/down/init/reit).
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await _run_yf(yf.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching analyst data for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -1695,7 +1708,7 @@ async def get_analyst(
 
     # Consensus price targets (mean, low, high, median, current)
     try:
-        pt = await asyncio.to_thread(ticker.get_analyst_price_targets)
+        pt = await _run_yf(ticker.get_analyst_price_targets)
         if pt:
             result["price_targets"] = pt
     except Exception as exc:
@@ -1703,7 +1716,7 @@ async def get_analyst(
 
     # Period-by-period consensus (strongBuy / buy / hold / sell / strongSell)
     try:
-        rec_df = await asyncio.to_thread(ticker.get_recommendations, False)
+        rec_df = await _run_yf(ticker.get_recommendations, False)
         if rec_df is not None and not rec_df.empty:
             result["recommendations"] = rec_df.to_dict(orient="records")
     except Exception as exc:
@@ -1711,7 +1724,7 @@ async def get_analyst(
 
     # Firm-level upgrade/downgrade history
     try:
-        ud_df = await asyncio.to_thread(ticker.get_upgrades_downgrades, False)
+        ud_df = await _run_yf(ticker.get_upgrades_downgrades, False)
         if ud_df is not None and not ud_df.empty:
             ud_df = ud_df.copy().head(upgrades_limit)
             ud_df.index = ud_df.index.strftime("%Y-%m-%d")
