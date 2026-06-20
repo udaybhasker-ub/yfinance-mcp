@@ -1,5 +1,6 @@
 import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -696,11 +697,21 @@ def _industry_key(name: str) -> str:
 _INDUSTRY_FETCH_CONCURRENCY = asyncio.Semaphore(4)
 _INDUSTRY_FETCH_TIMEOUT_SECONDS = 5.0
 
+# Dedicated pool so slow/throttled Yahoo calls for industry data can't starve the shared
+# default executor that every other tool (ticker info, news, financials, etc.) also uses
+# via asyncio.to_thread. A stalled call here only ever blocks within this pool.
+_INDUSTRY_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="yf-industry")
+
+
+async def _run_in_industry_executor(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_INDUSTRY_EXECUTOR, func, *args)
+
 
 async def _fetch_industry_table_once(industry_name: str, attr: str, expected_sector_key: str) -> Any:
-    industry = await asyncio.to_thread(yf.Industry, _industry_key(industry_name))
-    table = await asyncio.to_thread(lambda: getattr(industry, attr))
-    sector_key = await asyncio.to_thread(lambda: industry.sector_key)
+    industry = await _run_in_industry_executor(yf.Industry, _industry_key(industry_name))
+    table = await _run_in_industry_executor(lambda: getattr(industry, attr))
+    sector_key = await _run_in_industry_executor(lambda: industry.sector_key)
     if sector_key != expected_sector_key:
         logger.warning(
             "Industry '{}' returned sector_key '{}', expected '{}'; skipping.",
