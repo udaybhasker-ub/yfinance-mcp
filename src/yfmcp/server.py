@@ -21,6 +21,7 @@ from yfinance.exceptions import YFRateLimitError
 from yfmcp.auth import SharedSecretOAuthProvider
 from yfmcp.chart import generate_chart
 from yfmcp.screener import build_screener_query
+from yfmcp.screener import filter_us_currency_quotes
 from yfmcp.types import ChartType
 from yfmcp.types import Interval
 from yfmcp.types import OptionChainType
@@ -474,6 +475,9 @@ async def screen(
             details={"query_type": query_type, "exception": str(exc)},
         )
 
+    if query_type == "equity":
+        result = filter_us_currency_quotes(result)
+
     return dump_json(result)
 
 
@@ -556,6 +560,8 @@ async def screen_gappers(
             error_code="API_ERROR",
             details={"exception": str(exc)},
         )
+
+    result = filter_us_currency_quotes(result)
 
     return dump_json(result)
 
@@ -675,6 +681,34 @@ def _industry_key(name: str) -> str:
     return name.lower().replace("& ", "").replace("- ", "").replace(", ", " ").replace("—", "-").replace(" ", "-")
 
 
+_INDUSTRY_FETCH_CONCURRENCY = asyncio.Semaphore(4)
+
+
+async def _fetch_industry_table(industry_name: str, attr: str) -> Any:
+    """Fetch a per-industry table with one retry, since sectors with many industries
+
+    (e.g. Industrials has 25) fan out into many Yahoo calls, and a single slow/rate-limited
+    call used to stall the whole tool past the MCP client's timeout. Concurrency is capped
+    via a semaphore rather than firing all requests at once, to avoid bursting Yahoo's
+    unofficial, undocumented endpoint and risking IP throttling/blocking.
+    """
+    async with _INDUSTRY_FETCH_CONCURRENCY:
+        for attempt in range(2):
+            try:
+                industry = await asyncio.to_thread(yf.Industry, _industry_key(industry_name))
+                return await asyncio.to_thread(lambda: getattr(industry, attr))
+            except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.warning("Failed to load industry {} after retry: {}", industry_name, exc)
+                return None
+            except Exception as exc:
+                logger.warning("Failed to load industry {}: {}", industry_name, exc)
+                return None
+        return None
+
+
 async def get_top_growth_companies(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top growth companies per industry", ge=1)],
@@ -695,15 +729,12 @@ async def get_top_growth_companies(
             details={"sector": sector, "valid_sectors": list(SECTOR_INDUSTY_MAPPING.keys())},
         )
 
-    results = []
-    for industry_name in industries:
-        try:
-            industry = await asyncio.to_thread(yf.Industry, _industry_key(industry_name))
-        except Exception as exc:
-            logger.warning("Failed to load industry {}: {}", industry_name, exc)
-            continue
+    tables = await asyncio.gather(
+        *(_fetch_industry_table(industry_name, "top_growth_companies") for industry_name in industries)
+    )
 
-        df = await asyncio.to_thread(lambda i=industry: i.top_growth_companies)
+    results = []
+    for industry_name, df in zip(industries, tables):
         if df is None or df.empty:
             continue
 
@@ -744,15 +775,12 @@ async def get_top_performing_companies(
             details={"sector": sector, "valid_sectors": list(SECTOR_INDUSTY_MAPPING.keys())},
         )
 
-    results = []
-    for industry_name in industries:
-        try:
-            industry = await asyncio.to_thread(yf.Industry, _industry_key(industry_name))
-        except Exception as exc:
-            logger.warning("Failed to load industry {}: {}", industry_name, exc)
-            continue
+    tables = await asyncio.gather(
+        *(_fetch_industry_table(industry_name, "top_performing_companies") for industry_name in industries)
+    )
 
-        df = await asyncio.to_thread(lambda i=industry: i.top_performing_companies)
+    results = []
+    for industry_name, df in zip(industries, tables):
         if df is None or df.empty:
             continue
 

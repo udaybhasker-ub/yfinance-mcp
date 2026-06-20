@@ -27,6 +27,38 @@ def build_screener_query(query_type: str, query: dict[str, Any]) -> ScreenerQuer
             raise ValueError("query_type must be 'equity' or 'fund' for custom queries")
 
 
+def filter_us_currency_quotes(result: dict[str, Any]) -> dict[str, Any]:
+    """Drop foreign-currency OTC ADRs and duplicate multi-listings from an equity screen result.
+
+    Yahoo's screener has no 'financialCurrency' field to filter on (region='us' only means the
+    listing trades on a US market/OTC desk, not that the company itself is US-domiciled), so
+    foreign companies cross-listed as OTC ADRs (e.g. Fujikura, Volkswagen, Sumitomo Electric)
+    pass the region filter with region='US' but report financialCurrency in JPY/EUR/etc. We
+    filter those out here, and dedupe companies that show up under multiple OTC ticker symbols
+    (e.g. FJIKY and FKURF both being Fujikura Ltd.), keeping the first (best-ranked) listing.
+    """
+    quotes = result.get("quotes")
+    if not isinstance(quotes, list):
+        return result
+
+    seen_names: set[str] = set()
+    filtered = []
+    for quote in quotes:
+        if not isinstance(quote, dict):
+            continue
+        financial_currency = quote.get("financialCurrency")
+        if financial_currency is not None and financial_currency != "USD":
+            continue
+        name = quote.get("longName") or quote.get("shortName")
+        if name in seen_names:
+            continue
+        if name is not None:
+            seen_names.add(name)
+        filtered.append(quote)
+
+    return {**result, "quotes": filtered, "count": len(filtered)}
+
+
 def _has_region_constraint(node: dict[str, Any]) -> bool:
     """Check whether a query tree already constrains the 'region' field.
 
