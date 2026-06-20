@@ -1,5 +1,7 @@
 import asyncio
+import functools
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +119,34 @@ async def _run_yf(func, *args, **kwargs):
         return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=_YF_CALL_TIMEOUT_SECONDS)
 
 
+def _logged_tool(func):
+    """Log every tool invocation's outcome and duration.
+
+    Without this, only the warning/error paths inside individual tools ever logged
+    anything, so successful calls (the vast majority) were invisible in Railway logs.
+    """
+    tool_name = func.__name__
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.monotonic()
+        try:
+            result = await func(*args, **kwargs)
+        except asyncio.CancelledError:
+            logger.warning("tool={} status=suspended duration={:.2f}s", tool_name, time.monotonic() - start)
+            raise
+        except Exception as exc:
+            logger.error(
+                "tool={} status=failed duration={:.2f}s error={}", tool_name, time.monotonic() - start, exc
+            )
+            raise
+        else:
+            logger.info("tool={} status=success duration={:.2f}s", tool_name, time.monotonic() - start)
+            return result
+
+    return wrapper
+
+
 def _is_retryable_yfinance_error(exc: BaseException) -> bool:
     return isinstance(exc, _RETRYABLE_YFINANCE_EXCEPTIONS)
 
@@ -207,6 +237,7 @@ def _create_option_chain_fetch_error(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_ticker_info(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
 ) -> str:
@@ -270,6 +301,7 @@ async def get_ticker_info(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_ticker_news(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
 ) -> str:
@@ -320,6 +352,7 @@ async def get_ticker_news(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def search(
     query: Annotated[str, Field(description="Search query - company name, ticker symbol, or keywords")],
     search_type: Annotated[
@@ -390,6 +423,7 @@ async def search(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def screen(
     query: Annotated[
         str | dict[str, Any],
@@ -514,6 +548,7 @@ async def screen(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def screen_gappers(
     min_percent_change: Annotated[
         float,
@@ -901,6 +936,7 @@ async def get_top_performing_companies(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_top(
     sector: Annotated[
         Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare', 'Financial Services')")
@@ -976,6 +1012,7 @@ async def get_top(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_price_history(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
     period: Annotated[
@@ -1090,6 +1127,7 @@ async def get_price_history(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_financials(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
     frequency: Annotated[
@@ -1261,6 +1299,7 @@ async def _fetch_option_chain_for_date(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_option_chain(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
     expiration_date: Annotated[
@@ -1370,6 +1409,7 @@ async def get_option_chain(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_option_dates(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
 ) -> str:
@@ -1442,6 +1482,7 @@ async def _fetch_holder_section(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_holders(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
     max_rows: Annotated[
@@ -1583,6 +1624,7 @@ def main() -> None:
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_earnings(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'NVDA')")],
     history_limit: Annotated[
@@ -1677,6 +1719,7 @@ async def get_earnings(
         openWorldHint=True,
     ),
 )
+@_logged_tool
 async def get_analyst(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'NVDA')")],
     upgrades_limit: Annotated[
