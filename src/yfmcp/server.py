@@ -29,6 +29,13 @@ from yfmcp.utils import dump_json
 mcp = FastMCP("yfinance_mcp", log_level="ERROR")
 
 
+@mcp.custom_route("/health", methods=["GET"], name="health", include_in_schema=False)
+async def health_check(request: Any) -> Any:
+    """Health check endpoint for Railway and other platforms."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok", "service": "yfinance-mcp"})
+
+
 _RETRYABLE_YFINANCE_EXCEPTIONS: tuple[type[Exception], ...] = (
     ConnectionError,
     TimeoutError,
@@ -1372,4 +1379,184 @@ async def get_holders(
 
 
 def main() -> None:
-    mcp.run()
+    import os
+
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+
+    if transport == "streamable-http":
+        mcp.settings.host = "0.0.0.0"
+        mcp.settings.port = int(os.environ.get("PORT", "8000"))
+        mcp.settings.streamable_http_path = "/mcp"
+        mcp.run(transport="streamable-http")
+    elif transport == "sse":
+        mcp.settings.host = "0.0.0.0"
+        mcp.settings.port = int(os.environ.get("PORT", "8000"))
+        mcp.run(transport="sse")
+    else:
+        mcp.run(transport="stdio")
+
+
+@mcp.tool(
+    name="yfinance_get_earnings",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def get_earnings(
+    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'NVDA')")],
+    history_limit: Annotated[
+        int,
+        Field(description="Number of past/future earnings dates to return (max 100). Default 12 = ~3 years.", ge=1, le=100),
+    ] = 12,
+) -> str:
+    """Fetch earnings beat/miss history, forward EPS/revenue estimates, and EPS revision trends.
+
+    Returns JSON with:
+    - earnings_dates: Historical and upcoming earnings with EPS Estimate, Reported EPS,
+      and Surprise(%) — use this for beat/miss history and upcoming earnings dates.
+    - earnings_estimate: Forward EPS estimates for current quarter (0q), next quarter (+1q),
+      current year (0y), next year (+1y) with analyst count, avg, low, high, yearAgoEps, growth.
+    - revenue_estimate: Same structure as earnings_estimate but for revenue.
+    - eps_trend: How current EPS estimates compare to 7, 30, 60, 90 days ago per period.
+    - eps_revisions: Count of upward/downward analyst EPS revisions over last 7 and 30 days.
+    """
+    try:
+        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+        return _create_retryable_error_response(f"fetching earnings for '{symbol}'", exc, {"symbol": symbol})
+    except Exception as exc:
+        return create_error_response(
+            f"Failed to fetch earnings for '{symbol}'. Verify the symbol is correct.",
+            error_code="API_ERROR",
+            details={"symbol": symbol, "exception": str(exc)},
+        )
+
+    result: dict[str, Any] = {}
+
+    # Historical beat/miss + upcoming dates
+    try:
+        dates_df = await asyncio.to_thread(ticker.get_earnings_dates, history_limit)
+        if dates_df is not None and not dates_df.empty:
+            dates_df = dates_df.copy()
+            dates_df.index = dates_df.index.strftime("%Y-%m-%d %H:%M %Z")
+            result["earnings_dates"] = dates_df.to_dict(orient="index")
+    except Exception as exc:
+        logger.warning("Failed to fetch earnings_dates for {}: {}", symbol, exc)
+
+    # Forward EPS estimates (0q, +1q, 0y, +1y)
+    try:
+        ee = await asyncio.to_thread(ticker.get_earnings_estimate, True)
+        if ee:
+            result["earnings_estimate"] = ee
+    except Exception as exc:
+        logger.warning("Failed to fetch earnings_estimate for {}: {}", symbol, exc)
+
+    # Forward revenue estimates
+    try:
+        re = await asyncio.to_thread(ticker.get_revenue_estimate, True)
+        if re:
+            result["revenue_estimate"] = re
+    except Exception as exc:
+        logger.warning("Failed to fetch revenue_estimate for {}: {}", symbol, exc)
+
+    # EPS trend vs 7/30/60/90 days ago
+    try:
+        et = await asyncio.to_thread(ticker.get_eps_trend, True)
+        if et:
+            result["eps_trend"] = et
+    except Exception as exc:
+        logger.warning("Failed to fetch eps_trend for {}: {}", symbol, exc)
+
+    # Revision counts (up/down last 7d and 30d)
+    try:
+        er = await asyncio.to_thread(ticker.get_eps_revisions, True)
+        if er:
+            result["eps_revisions"] = er
+    except Exception as exc:
+        logger.warning("Failed to fetch eps_revisions for {}: {}", symbol, exc)
+
+    if not result:
+        return create_error_response(
+            f"No earnings data available for '{symbol}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol},
+        )
+
+    return dump_json(result)
+
+
+@mcp.tool(
+    name="yfinance_get_analyst",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def get_analyst(
+    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'NVDA')")],
+    upgrades_limit: Annotated[
+        int,
+        Field(description="Number of recent firm upgrades/downgrades to return. Default 20.", ge=1, le=200),
+    ] = 20,
+) -> str:
+    """Fetch analyst consensus breakdown, price targets, and upgrade/downgrade history.
+
+    Returns JSON with:
+    - price_targets: Consensus price target — current, low, high, mean, median.
+    - recommendations: Period-by-period breakdown with strongBuy, buy, hold, sell,
+      strongSell counts. Most recent period reflects current analyst consensus.
+    - upgrades_downgrades: Firm-level grade changes with firm name, fromGrade,
+      toGrade, and action (up/down/init/reit).
+    """
+    try:
+        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+        return _create_retryable_error_response(f"fetching analyst data for '{symbol}'", exc, {"symbol": symbol})
+    except Exception as exc:
+        return create_error_response(
+            f"Failed to fetch analyst data for '{symbol}'. Verify the symbol is correct.",
+            error_code="API_ERROR",
+            details={"symbol": symbol, "exception": str(exc)},
+        )
+
+    result: dict[str, Any] = {}
+
+    # Consensus price targets (mean, low, high, median, current)
+    try:
+        pt = await asyncio.to_thread(ticker.get_analyst_price_targets)
+        if pt:
+            result["price_targets"] = pt
+    except Exception as exc:
+        logger.warning("Failed to fetch analyst_price_targets for {}: {}", symbol, exc)
+
+    # Period-by-period consensus (strongBuy / buy / hold / sell / strongSell)
+    try:
+        rec_df = await asyncio.to_thread(ticker.get_recommendations, False)
+        if rec_df is not None and not rec_df.empty:
+            result["recommendations"] = rec_df.to_dict(orient="records")
+    except Exception as exc:
+        logger.warning("Failed to fetch recommendations for {}: {}", symbol, exc)
+
+    # Firm-level upgrade/downgrade history
+    try:
+        ud_df = await asyncio.to_thread(ticker.get_upgrades_downgrades, False)
+        if ud_df is not None and not ud_df.empty:
+            ud_df = ud_df.copy().head(upgrades_limit)
+            ud_df.index = ud_df.index.strftime("%Y-%m-%d")
+            result["upgrades_downgrades"] = ud_df.reset_index().to_dict(orient="records")
+    except Exception as exc:
+        logger.warning("Failed to fetch upgrades_downgrades for {}: {}", symbol, exc)
+
+    if not result:
+        return create_error_response(
+            f"No analyst data available for '{symbol}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol},
+        )
+
+    return dump_json(result)

@@ -218,6 +218,36 @@ Fetch option chain data (calls and puts) for a stock with available strike price
 - `contractSize`: Contract size (REGULAR)
 - `currency`: Currency (USD)
 
+### `yfinance_get_earnings`
+
+Fetch earnings beat/miss history, forward EPS/revenue estimates, and EPS revision trends.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `NVDA`) |
+| `history_limit` | number | No | Number of past/future earnings dates to return (max `100`). Default `12` (~3 years) |
+
+**Returns:** JSON object with:
+- **`earnings_dates`** — Historical and upcoming earnings with EPS Estimate, Reported EPS, and Surprise(%)
+- **`earnings_estimate`** — Forward EPS estimates for current quarter (`0q`), next quarter (`+1q`), current year (`0y`), next year (`+1y`) with analyst count, avg, low, high, yearAgoEps, growth
+- **`revenue_estimate`** — Same structure as `earnings_estimate` but for revenue
+- **`eps_trend`** — How current EPS estimates compare to 7, 30, 60, 90 days ago per period
+- **`eps_revisions`** — Count of upward/downward analyst EPS revisions over last 7 and 30 days
+
+### `yfinance_get_analyst`
+
+Fetch analyst consensus breakdown, price targets, and upgrade/downgrade history.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `NVDA`) |
+| `upgrades_limit` | number | No | Number of recent firm upgrades/downgrades to return. Default `20` |
+
+**Returns:** JSON object with:
+- **`price_targets`** — Consensus price target: current, low, high, mean, median
+- **`recommendations`** — Period-by-period breakdown with strongBuy, buy, hold, sell, strongSell counts. Most recent period reflects current analyst consensus
+- **`upgrades_downgrades`** — Firm-level grade changes with firm name, fromGrade, toGrade, and action (up/down/init/reit)
+
 ## Usage
 
 ### Via uv (recommended)
