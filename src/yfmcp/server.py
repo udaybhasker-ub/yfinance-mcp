@@ -759,6 +759,34 @@ async def _fetch_industry_table(industry_name: str, attr: str, expected_sector_k
         return None
 
 
+_INDUSTRY_FAN_OUT_DEADLINE_SECONDS = 60.0
+
+
+async def _gather_industry_tables(industries: list[str], attr: str, expected_sector_key: str) -> list[Any]:
+    """Run per-industry fetches with a hard wall-clock deadline for the whole fan-out.
+
+    Per-attempt timeouts in _fetch_industry_table only bound a single fetch once it starts
+    running; if multiple get_top calls land concurrently (e.g. overlapping users/tests) and
+    queue behind each other in the shared dedicated executor, the *aggregate* wait can still
+    stretch out far longer, as seen in production (89s/164s/295s for single tool calls). This
+    caps the entire fan-out so the tool call returns whatever finished in time instead of
+    hanging until an external timeout (MCP client, platform edge proxy) kills it.
+    """
+    if not industries:
+        return []
+
+    tasks = [
+        asyncio.ensure_future(_fetch_industry_table(industry_name, attr, expected_sector_key))
+        for industry_name in industries
+    ]
+    done, pending = await asyncio.wait(tasks, timeout=_INDUSTRY_FAN_OUT_DEADLINE_SECONDS)
+    for task in pending:
+        task.cancel()
+    if pending:
+        logger.warning("Industry fan-out deadline hit; {} of {} industries unfinished.", len(pending), len(tasks))
+    return [task.result() if task in done and not task.cancelled() else None for task in tasks]
+
+
 async def get_top_growth_companies(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top growth companies per industry", ge=1)],
@@ -779,13 +807,9 @@ async def get_top_growth_companies(
             details={"sector": sector, "valid_sectors": list(SECTOR_INDUSTY_MAPPING.keys())},
         )
 
+    industries = list(industries)
     expected_sector_key = _sector_key(sector)
-    tables = await asyncio.gather(
-        *(
-            _fetch_industry_table(industry_name, "top_growth_companies", expected_sector_key)
-            for industry_name in industries
-        )
-    )
+    tables = await _gather_industry_tables(industries, "top_growth_companies", expected_sector_key)
 
     results = []
     for industry_name, df in zip(industries, tables):
@@ -829,13 +853,9 @@ async def get_top_performing_companies(
             details={"sector": sector, "valid_sectors": list(SECTOR_INDUSTY_MAPPING.keys())},
         )
 
+    industries = list(industries)
     expected_sector_key = _sector_key(sector)
-    tables = await asyncio.gather(
-        *(
-            _fetch_industry_table(industry_name, "top_performing_companies", expected_sector_key)
-            for industry_name in industries
-        )
-    )
+    tables = await _gather_industry_tables(industries, "top_performing_companies", expected_sector_key)
 
     results = []
     for industry_name, df in zip(industries, tables):
