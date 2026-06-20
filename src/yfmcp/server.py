@@ -1381,16 +1381,21 @@ async def get_holders(
 def main() -> None:
     import os
 
+    from mcp.server.transport_security import TransportSecuritySettings
+
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
 
-    if transport == "streamable-http":
+    if transport in ("streamable-http", "sse"):
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = int(os.environ.get("PORT", "8000"))
+        # Server is fronted by Railway's edge proxy, which rewrites the Host header to the
+        # public domain; the SDK's DNS-rebinding check rejects that by default, so disable it.
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    if transport == "streamable-http":
         mcp.settings.streamable_http_path = "/mcp"
         mcp.run(transport="streamable-http")
     elif transport == "sse":
-        mcp.settings.host = "0.0.0.0"
-        mcp.settings.port = int(os.environ.get("PORT", "8000"))
         mcp.run(transport="sse")
     else:
         mcp.run(transport="stdio")
