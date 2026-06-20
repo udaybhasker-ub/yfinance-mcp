@@ -694,6 +694,22 @@ def _industry_key(name: str) -> str:
 
 
 _INDUSTRY_FETCH_CONCURRENCY = asyncio.Semaphore(4)
+_INDUSTRY_FETCH_TIMEOUT_SECONDS = 5.0
+
+
+async def _fetch_industry_table_once(industry_name: str, attr: str, expected_sector_key: str) -> Any:
+    industry = await asyncio.to_thread(yf.Industry, _industry_key(industry_name))
+    table = await asyncio.to_thread(lambda: getattr(industry, attr))
+    sector_key = await asyncio.to_thread(lambda: industry.sector_key)
+    if sector_key != expected_sector_key:
+        logger.warning(
+            "Industry '{}' returned sector_key '{}', expected '{}'; skipping.",
+            industry_name,
+            sector_key,
+            expected_sector_key,
+        )
+        return None
+    return table
 
 
 async def _fetch_industry_table(industry_name: str, attr: str, expected_sector_key: str) -> Any:
@@ -704,25 +720,23 @@ async def _fetch_industry_table(industry_name: str, attr: str, expected_sector_k
     via a semaphore rather than firing all requests at once, to avoid bursting Yahoo's
     unofficial, undocumented endpoint and risking IP throttling/blocking.
 
+    yfinance's default per-request HTTP timeout is 30s, which is too generous for an
+    interactive tool call: a handful of slow/throttled industries can exhaust the MCP
+    client's overall timeout even with capped concurrency. Each attempt is bounded to
+    _INDUSTRY_FETCH_TIMEOUT_SECONDS so a stalled call fails fast and frees its slot
+    instead of consuming a full 30s.
+
     Also verifies the fetched industry actually belongs to the requested sector before
     returning its table, as a guard against returning data for the wrong sector.
     """
     async with _INDUSTRY_FETCH_CONCURRENCY:
         for attempt in range(2):
             try:
-                industry = await asyncio.to_thread(yf.Industry, _industry_key(industry_name))
-                table = await asyncio.to_thread(lambda: getattr(industry, attr))
-                sector_key = await asyncio.to_thread(lambda: industry.sector_key)
-                if sector_key != expected_sector_key:
-                    logger.warning(
-                        "Industry '{}' returned sector_key '{}', expected '{}'; skipping.",
-                        industry_name,
-                        sector_key,
-                        expected_sector_key,
-                    )
-                    return None
-                return table
-            except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+                return await asyncio.wait_for(
+                    _fetch_industry_table_once(industry_name, attr, expected_sector_key),
+                    timeout=_INDUSTRY_FETCH_TIMEOUT_SECONDS,
+                )
+            except (TimeoutError, *_RETRYABLE_YFINANCE_EXCEPTIONS) as exc:
                 if attempt == 0:
                     await asyncio.sleep(0.5)
                     continue
