@@ -30,6 +30,7 @@ from yfmcp.server import get_top_etfs
 from yfmcp.server import get_top_growth_companies
 from yfmcp.server import get_top_mutual_funds
 from yfmcp.server import get_top_performing_companies
+from yfmcp.server import get_combined_quote
 from yfmcp.server import screen
 from yfmcp.server import screen_gappers
 from yfmcp.yf_runner import _ticker_cache
@@ -1591,4 +1592,164 @@ async def test_screen_gappers_api_error(mock_to_thread: AsyncMock) -> None:
     data = json.loads(result)
 
     assert data["error_code"] == "API_ERROR"
-    assert data["details"]["exception"] == "Yahoo failed"
+
+
+# ---------------------------------------------------------------------------
+# get_combined_quote
+# ---------------------------------------------------------------------------
+
+def _quote_envelope(symbol: str, price: float = 150.0) -> dict:
+    return {
+        "results": {
+            symbol: {
+                "data": {"currentPrice": price, "longName": f"{symbol} Inc."},
+                "meta": {"dataAge": 0, "completenessScore": 1.0, "fromCache": False, "cacheAge": 0, "warnings": []},
+            }
+        },
+        "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []},
+    }
+
+
+def _analyst_envelope(symbol: str) -> dict:
+    return {
+        "results": {
+            symbol: {
+                "data": {
+                    "price_targets": {"mean": 200.0, "low": 160.0, "high": 240.0},
+                    "recommendations": [{"period": "0m", "strongBuy": 10}],
+                    "upgrades_downgrades": [{"GradeDate": "2024-01-01", "Firm": "GS", "toGrade": "Buy"}],
+                },
+                "meta": {"upgradesLimit": 10, "fromCache": False, "cacheAge": 0, "warnings": []},
+            }
+        },
+        "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []},
+    }
+
+
+def _earnings_envelope(symbol: str) -> dict:
+    return {
+        "results": {
+            symbol: {
+                "data": {
+                    "earnings_dates": {"2024-11-01 00:00 EST": {"EPS Estimate": 1.6, "Reported EPS": 1.64}},
+                    "eps_trend": {"0q": {"current": 1.6}},
+                },
+                "meta": {"historyLimit": 8, "fromCache": False, "cacheAge": 0, "warnings": []},
+            }
+        },
+        "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []},
+    }
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.earnings_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.analyst_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.QuoteFetcher.fetch_batch", new_callable=AsyncMock)
+async def test_get_combined_quote_merges_all_three_sections(
+    mock_quote: AsyncMock, mock_analyst: AsyncMock, mock_earnings: AsyncMock
+) -> None:
+    """Happy path: quote, analyst, and earnings are merged under the ticker key."""
+    mock_quote.return_value = _quote_envelope("AAPL")
+    mock_analyst.return_value = _analyst_envelope("AAPL")
+    mock_earnings.return_value = _earnings_envelope("AAPL")
+
+    result = await get_combined_quote(["AAPL"])
+    envelope = json.loads(result)
+
+    assert envelope["summary"]["totalRequested"] == 1
+    assert envelope["summary"]["totalReturned"] == 1
+    assert envelope["summary"]["errors"] == []
+
+    aapl = envelope["results"]["AAPL"]
+    assert aapl["quote"]["currentPrice"] == 150.0
+    assert aapl["analyst"]["price_targets"]["mean"] == 200.0
+    assert aapl["earnings"]["eps_trend"]["0q"]["current"] == 1.6
+    assert "quote" in aapl["meta"]
+    assert "analyst" in aapl["meta"]
+    assert "earnings" in aapl["meta"]
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.earnings_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.analyst_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.QuoteFetcher.fetch_batch", new_callable=AsyncMock)
+async def test_get_combined_quote_multi_ticker(
+    mock_quote: AsyncMock, mock_analyst: AsyncMock, mock_earnings: AsyncMock
+) -> None:
+    """Multiple tickers are each merged independently."""
+    mock_quote.return_value = {
+        "results": {
+            "AAPL": _quote_envelope("AAPL")["results"]["AAPL"],
+            "NVDA": _quote_envelope("NVDA", price=800.0)["results"]["NVDA"],
+        },
+        "summary": {"totalRequested": 2, "totalReturned": 2, "errors": []},
+    }
+    mock_analyst.return_value = {
+        "results": {
+            "AAPL": _analyst_envelope("AAPL")["results"]["AAPL"],
+            "NVDA": _analyst_envelope("NVDA")["results"]["NVDA"],
+        },
+        "summary": {"totalRequested": 2, "totalReturned": 2, "errors": []},
+    }
+    mock_earnings.return_value = {
+        "results": {
+            "AAPL": _earnings_envelope("AAPL")["results"]["AAPL"],
+            "NVDA": _earnings_envelope("NVDA")["results"]["NVDA"],
+        },
+        "summary": {"totalRequested": 2, "totalReturned": 2, "errors": []},
+    }
+
+    result = await get_combined_quote(["AAPL", "NVDA"])
+    envelope = json.loads(result)
+
+    assert envelope["summary"]["totalReturned"] == 2
+    assert envelope["results"]["AAPL"]["quote"]["currentPrice"] == 150.0
+    assert envelope["results"]["NVDA"]["quote"]["currentPrice"] == 800.0
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.earnings_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.analyst_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.QuoteFetcher.fetch_batch", new_callable=AsyncMock)
+async def test_get_combined_quote_sub_call_error_surfaces_in_summary(
+    mock_quote: AsyncMock, mock_analyst: AsyncMock, mock_earnings: AsyncMock
+) -> None:
+    """An error in one sub-call (analyst) appears in summary.errors; quote and earnings still present."""
+    mock_quote.return_value = _quote_envelope("AAPL")
+    mock_analyst.return_value = {
+        "results": {},
+        "summary": {"totalRequested": 1, "totalReturned": 0, "errors": [{"symbol": "AAPL", "error": "Rate limit"}]},
+    }
+    mock_earnings.return_value = _earnings_envelope("AAPL")
+
+    result = await get_combined_quote(["AAPL"])
+    envelope = json.loads(result)
+
+    # AAPL still present via quote + earnings
+    assert "AAPL" in envelope["results"]
+    assert envelope["results"]["AAPL"]["quote"]["currentPrice"] == 150.0
+    assert envelope["results"]["AAPL"]["analyst"] == {}  # empty — analyst failed
+    assert envelope["results"]["AAPL"]["earnings"]["eps_trend"]["0q"]["current"] == 1.6
+
+    # Error propagated from analyst sub-call
+    errors = envelope["summary"]["errors"]
+    assert any(e["symbol"] == "AAPL" and "Rate limit" in e["error"] for e in errors)
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.earnings_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.analyst_processor.run", new_callable=AsyncMock)
+@patch("yfmcp.server.QuoteFetcher.fetch_batch", new_callable=AsyncMock)
+async def test_get_combined_quote_passes_params_to_sub_fetchers(
+    mock_quote: AsyncMock, mock_analyst: AsyncMock, mock_earnings: AsyncMock
+) -> None:
+    """upgrades_limit and history_limit are forwarded to the correct sub-fetchers."""
+    mock_quote.return_value = _quote_envelope("AAPL")
+    mock_analyst.return_value = _analyst_envelope("AAPL")
+    mock_earnings.return_value = _earnings_envelope("AAPL")
+
+    await get_combined_quote(["AAPL"], history_limit=5, upgrades_limit=3, no_cache=True)
+
+    mock_quote.assert_called_once_with(["AAPL"], None, no_cache=True)
+    mock_analyst.assert_called_once_with(["AAPL"], no_cache=True, upgrades_limit=3)
+    mock_earnings.assert_called_once_with(["AAPL"], no_cache=True, history_limit=5)

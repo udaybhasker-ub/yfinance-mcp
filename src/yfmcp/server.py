@@ -1471,3 +1471,120 @@ async def get_analyst(
     Useful for watchlist-wide consensus sweeps. Results cached for 1 hour.
     """
     return dump_json(await analyst_processor.run(symbols, no_cache=no_cache, upgrades_limit=upgrades_limit))
+
+
+@mcp.tool(
+    name="yfinance_get_combined_quote",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@_logged_tool
+async def get_combined_quote(
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'NVDA']. "
+                "Up to 20 tickers per call."
+            ),
+            min_length=1,
+            max_length=20,
+        ),
+    ],
+    quote_fields: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Optional list of yfinance ticker.info field names to include in the quote section. "
+                "When omitted, the curated ~35-field default set is used."
+            ),
+        ),
+    ] = None,
+    history_limit: Annotated[
+        int,
+        Field(
+            description="Number of past/future earnings dates to return per ticker (max 100). Default 8.",
+            ge=1,
+            le=100,
+        ),
+    ] = 8,
+    upgrades_limit: Annotated[
+        int,
+        Field(description="Number of recent firm upgrades/downgrades to return per ticker. Default 10.", ge=1, le=200),
+    ] = 10,
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass all caches and fetch fresh data. Results are written back to cache."),
+    ] = False,
+) -> str:
+    """Fetch quote + analyst + earnings for one or more tickers in a single call.
+
+    Runs all three fetches concurrently and merges the results under a single envelope keyed by ticker.
+
+    Response shape:
+        {
+          "results": {
+            "AAPL": {
+              "quote": { ...~35 price/valuation/identity fields... },
+              "analyst": {
+                "price_targets": {...},
+                "recommendations": [...],
+                "upgrades_downgrades": [...]
+              },
+              "earnings": {
+                "earnings_dates": {...},
+                "earnings_estimate": {...},
+                "revenue_estimate": {...},
+                "eps_trend": {...},
+                "eps_revisions": {...}
+              },
+              "meta": {
+                "quote": {...},
+                "analyst": {...},
+                "earnings": {...}
+              }
+            }
+          },
+          "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []}
+        }
+
+    Use this instead of calling yfinance_get_quote + yfinance_get_analyst + yfinance_get_earnings separately.
+    All three fetches run in parallel server-side; cached results are served from their respective caches.
+    """
+    quote_task = QuoteFetcher.fetch_batch(symbols, quote_fields, no_cache=no_cache)
+    analyst_task = analyst_processor.run(symbols, no_cache=no_cache, upgrades_limit=upgrades_limit)
+    earnings_task = earnings_processor.run(symbols, no_cache=no_cache, history_limit=history_limit)
+
+    quote_res, analyst_res, earnings_res = await asyncio.gather(quote_task, analyst_task, earnings_task)
+
+    merged: dict = {"results": {}, "summary": {"totalRequested": len(symbols), "totalReturned": 0, "errors": []}}
+
+    all_symbols = set(quote_res.get("results", {}).keys()) | set(analyst_res.get("results", {}).keys()) | set(earnings_res.get("results", {}).keys())
+
+    for sym in all_symbols:
+        q = quote_res.get("results", {}).get(sym, {})
+        a = analyst_res.get("results", {}).get(sym, {})
+        e = earnings_res.get("results", {}).get(sym, {})
+
+        merged["results"][sym] = {
+            "quote": q.get("data", {}),
+            "analyst": a.get("data", {}),
+            "earnings": e.get("data", {}),
+            "meta": {
+                "quote": q.get("meta", {}),
+                "analyst": a.get("meta", {}),
+                "earnings": e.get("meta", {}),
+            },
+        }
+
+    # Collect errors from all three sub-calls
+    for sub in (quote_res, analyst_res, earnings_res):
+        merged["summary"]["errors"].extend(sub.get("summary", {}).get("errors", []))
+
+    merged["summary"]["totalReturned"] = len(merged["results"])
+
+    return dump_json(merged)
