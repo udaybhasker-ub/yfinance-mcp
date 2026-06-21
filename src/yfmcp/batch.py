@@ -125,9 +125,16 @@ class BatchProcessor:
         self._batch_size = batch_size
         self._batch_delay = batch_delay_seconds
 
-    async def _fetch_one(self, symbol: str, kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Check cache then live-fetch; stamps ``meta.fromCache`` / ``meta.cacheAge``."""
-        if self._cache is not None:
+    async def _fetch_one(self, symbol: str, kwargs: dict[str, Any], *, no_cache: bool = False) -> dict[str, Any]:
+        """Check cache then live-fetch; stamps ``meta.fromCache`` / ``meta.cacheAge``.
+
+        Parameters
+        ----------
+        no_cache:
+            When ``True``, skip the cache read (always fetch fresh) but still
+            write the fresh result back to the cache so the next call benefits.
+        """
+        if self._cache is not None and not no_cache:
             cached = await self._cache.get(symbol, kwargs)
             if cached is not None:
                 value, cached_at = cached
@@ -147,11 +154,22 @@ class BatchProcessor:
 
         return result
 
-    async def run(self, symbols: list[str], **kwargs: Any) -> dict[str, Any]:
+    async def run(self, symbols: list[str], *, no_cache: bool = False, **kwargs: Any) -> dict[str, Any]:
         """Fetch all symbols and return a standard FinMCP-shaped envelope.
 
         Symbols are normalised (strip + upper) and deduplicated while
         preserving order.
+
+        Parameters
+        ----------
+        symbols:
+            Ticker symbols to fetch.
+        no_cache:
+            When ``True``, bypass the cache read for every symbol and fetch
+            fresh data from Yahoo Finance.  Results are still written to the
+            cache so subsequent calls within the TTL are served from cache.
+        **kwargs:
+            Forwarded verbatim to ``fetch_fn``.
 
         Return shape::
 
@@ -185,7 +203,7 @@ class BatchProcessor:
         batches = [unique[i : i + self._batch_size] for i in range(0, len(unique), self._batch_size)]
 
         for batch_idx, batch in enumerate(batches):
-            batch_results = await asyncio.gather(*[self._fetch_one(sym, kwargs) for sym in batch])
+            batch_results = await asyncio.gather(*[self._fetch_one(sym, kwargs, no_cache=no_cache) for sym in batch])
 
             for sym, result in zip(batch, batch_results, strict=True):
                 if "error" in result:

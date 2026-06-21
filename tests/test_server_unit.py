@@ -18,6 +18,7 @@ from yfmcp.financials_fetcher import _cache as financials_cache
 from yfmcp.industry import _industry_key
 from yfmcp.news_fetcher import _cache as news_cache
 from yfmcp.price_history_fetcher import _cache as price_history_cache
+from yfmcp.quote_fetcher import _quote_cache
 from yfmcp.server import _sector_key
 from yfmcp.server import get_financials
 from yfmcp.server import get_holders
@@ -31,16 +32,21 @@ from yfmcp.server import get_top_mutual_funds
 from yfmcp.server import get_top_performing_companies
 from yfmcp.server import screen
 from yfmcp.server import screen_gappers
+from yfmcp.yf_runner import _ticker_cache
+from yfmcp.yf_runner import _ticker_inflight
 
 
 @pytest.fixture(autouse=True)
 def clear_fetcher_caches() -> None:
-    """Clear all batch-fetcher caches before each test to prevent inter-test contamination."""
+    """Clear all batch-fetcher and shared caches before each test to prevent inter-test contamination."""
     financials_cache.clear_sync()
     price_history_cache.clear_sync()
     earnings_cache.clear_sync()
     analyst_cache.clear_sync()
     news_cache.clear_sync()
+    _quote_cache.clear_sync()
+    _ticker_cache.clear_sync()
+    _ticker_inflight.clear()
 
 
 def _financials_df(rows: dict[str, list[int]]) -> pd.DataFrame:
@@ -150,7 +156,7 @@ def test_build_financials_response_ignores_none_and_empty_dataframes() -> None:
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.financials_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_annual_success(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test annual financials retrieval."""
@@ -171,7 +177,7 @@ async def test_get_financials_annual_success(mock_to_thread: AsyncMock, mock_tic
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.financials_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_quarterly_success(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test quarterly financials retrieval."""
@@ -192,7 +198,7 @@ async def test_get_financials_quarterly_success(mock_to_thread: AsyncMock, mock_
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.financials_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_ttm_success_only_income_statement(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
@@ -212,7 +218,7 @@ async def test_get_financials_ttm_success_only_income_statement(
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.financials_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_invalid_frequency(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test invalid financials frequency surfaces as a per-ticker error."""
@@ -230,7 +236,7 @@ async def test_get_financials_invalid_frequency(mock_to_thread: AsyncMock, mock_
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.financials_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_no_data(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test financials retrieval with no statement data surfaces as a per-ticker error."""
@@ -256,7 +262,7 @@ async def test_get_financials_no_data(mock_to_thread: AsyncMock, mock_ticker: Ma
     "exception",
     [TimeoutError("timed out"), OSError("network unreachable"), YFRateLimitError()],
 )
-@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.financials_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_ticker_creation_network_error(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock, exception: Exception
@@ -277,7 +283,7 @@ async def test_get_financials_ticker_creation_network_error(
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.financials_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_statement_read_api_error(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test statement read errors surface as per-ticker errors."""
@@ -295,7 +301,7 @@ async def test_get_financials_statement_read_api_error(mock_to_thread: AsyncMock
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.price_history_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_price_history_returns_markdown_table_when_chart_type_is_none(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
@@ -329,7 +335,7 @@ async def test_get_price_history_returns_markdown_table_when_chart_type_is_none(
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.price_history_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_price_history_passes_prepost_to_yfinance(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test price history can request pre-market and post-market rows."""
@@ -356,7 +362,7 @@ async def test_get_price_history_passes_prepost_to_yfinance(mock_to_thread: Asyn
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.price_history_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_price_history_no_data_includes_prepost_detail(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
@@ -378,7 +384,7 @@ async def test_get_price_history_no_data_includes_prepost_detail(
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.price_history_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_price_history_api_error_surfaces_in_envelope(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock

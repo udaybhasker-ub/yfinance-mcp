@@ -8,6 +8,17 @@ import pytest
 from yfinance.exceptions import YFRateLimitError
 
 from yfmcp.quote_fetcher import QuoteFetcher
+from yfmcp.quote_fetcher import _quote_cache
+from yfmcp.yf_runner import _ticker_cache
+from yfmcp.yf_runner import _ticker_inflight
+
+
+@pytest.fixture(autouse=True)
+def clear_caches() -> None:
+    """Clear quote and ticker caches between tests to prevent cross-test contamination."""
+    _quote_cache.clear_sync()
+    _ticker_cache.clear_sync()
+    _ticker_inflight.clear()
 
 
 async def _run_to_thread(func, *args, **kwargs):
@@ -17,7 +28,7 @@ async def _run_to_thread(func, *args, **kwargs):
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.quote_fetcher.yf.Ticker")
+@patch("yfmcp.quote_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_fetch_single_returns_curated_default_fields(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     mock_ticker_obj = MagicMock()
@@ -47,7 +58,7 @@ async def test_fetch_single_returns_curated_default_fields(mock_to_thread: Async
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.quote_fetcher.yf.Ticker")
+@patch("yfmcp.quote_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_fetch_single_respects_explicit_fields(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     mock_ticker_obj = MagicMock()
@@ -61,7 +72,7 @@ async def test_fetch_single_respects_explicit_fields(mock_to_thread: AsyncMock, 
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.quote_fetcher.yf.Ticker")
+@patch("yfmcp.quote_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_fetch_single_converts_timestamp_fields(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     mock_ticker_obj = MagicMock()
@@ -75,7 +86,7 @@ async def test_fetch_single_converts_timestamp_fields(mock_to_thread: AsyncMock,
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.quote_fetcher.yf.Ticker")
+@patch("yfmcp.quote_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_fetch_single_no_data_returns_error(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     mock_ticker_obj = MagicMock()
@@ -97,7 +108,7 @@ async def test_fetch_single_no_data_returns_error(mock_to_thread: AsyncMock, moc
         (YFRateLimitError(), "Rate limit reached"),
     ],
 )
-@patch("yfmcp.quote_fetcher.yf.Ticker")
+@patch("yfmcp.quote_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_fetch_single_retryable_errors(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock, exception: Exception, expected_substring: str
@@ -111,7 +122,7 @@ async def test_fetch_single_retryable_errors(
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.quote_fetcher.yf.Ticker")
+@patch("yfmcp.quote_fetcher._get_ticker", new_callable=AsyncMock)
 @patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_fetch_single_unexpected_error_returns_message(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     mock_ticker.side_effect = RuntimeError("boom")
@@ -125,7 +136,7 @@ async def test_fetch_single_unexpected_error_returns_message(mock_to_thread: Asy
 @pytest.mark.asyncio
 @patch("yfmcp.quote_fetcher.QuoteFetcher.fetch_single")
 async def test_fetch_batch_separates_results_and_errors(mock_fetch_single: AsyncMock) -> None:
-    async def fake_fetch_single(symbol, fields):
+    async def fake_fetch_single(symbol, fields, *, no_cache=False):
         if symbol == "BAD":
             return {"error": "No data for 'BAD'"}
         return {"data": {"currentPrice": 1.0}, "meta": {"dataAge": 0, "completenessScore": 1.0, "warnings": []}}

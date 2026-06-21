@@ -14,16 +14,43 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 ## Features
 
 - **Stock Data** — Company info, financials, valuation metrics, dividends, and trading data
-- **Financial Statements** — Income statement and balance sheet with historical data (EBIT, Invested Capital, etc.)
-- **Financial News** — Recent news articles and press releases for any ticker
+- **Batch Quotes** — Fetch price snapshots for up to 100 tickers in a single call
+- **Batch Price History** — OHLCV tables for up to 20 tickers at once; chart generation for single-ticker calls
+- **Batch Financials** — Income statement, balance sheet, and cash flow for up to 10 tickers (6 h cache)
+- **Batch Earnings** — EPS estimates, beat/miss history, and revision trends for up to 20 tickers (1 h cache)
+- **Batch Analyst** — Price targets, consensus ratings, and upgrade/downgrade history for up to 20 tickers (1 h cache)
+- **Batch News** — Recent articles and press releases for up to 20 tickers (5 min cache)
 - **Search** — Find stocks, ETFs, and news across Yahoo Finance
 - **Sector Rankings** — Top ETFs, mutual funds, companies, growth leaders, and top performers by sector
-- **Price History** — Historical OHLCV data as markdown tables or professional charts
 - **Chart Generation** — Candlestick, VWAP, and volume profile charts returned as WebP images
 - **Options Data** — Option chains with calls, puts, strike prices, IV, and expiration dates
 - **Ownership Data** — Major holders, institutional investors, mutual fund holders, and insider transactions
 
 ## Tools
+
+### Batch response envelope
+
+Tools that accept multiple symbols return a standard envelope so errors for individual tickers don't abort the whole call:
+
+```json
+{
+  "results": {
+    "AAPL": {
+      "data": { ... },
+      "meta": { "fromCache": false, "cacheAge": 0, "warnings": [] }
+    }
+  },
+  "summary": {
+    "totalRequested": 2,
+    "totalReturned": 1,
+    "errors": [{ "symbol": "BAD", "error": "No data for 'BAD'" }]
+  }
+}
+```
+
+`meta.fromCache` is `true` when the response was served from the in-memory TTL cache. `meta.cacheAge` is the number of seconds since the entry was cached.
+
+---
 
 ### `yfinance_get_ticker_info`
 
@@ -35,15 +62,28 @@ Retrieve comprehensive stock data including company info, financials, trading me
 
 **Returns:** JSON object with company details, price data, valuation metrics, trading info, dividends, financials, and performance indicators.
 
-### `yfinance_get_ticker_news`
+### `yfinance_get_quote`
 
-Fetch recent news articles and press releases for a specific stock.
+Batch quote fetch for one or more tickers with a curated, analysis-ready field set (vs the full `yfinance_get_ticker_info` payload). Results cached for **1 minute**.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `symbol` | string | Yes | Stock ticker symbol |
+| `symbols` | string[] | Yes | One or more stock ticker symbols. Up to 100 per call, processed in batches of 10 with a 200 ms delay between batches |
+| `fields` | string[] | No | Override the default ~35-field set with specific `yfinance` `ticker.info` field names |
+| `no_cache` | boolean | No | Bypass the 1-minute cache and fetch fresh quotes; result is written back to cache (default: `false`) |
 
-**Returns:** JSON array of news items with title, summary, publication date, provider, URL, and thumbnail.
+**Returns:** [Batch envelope](#batch-response-envelope) with price, volume, valuation, dividend, technical, analyst, earnings, growth, and identity fields per ticker. Each `meta` block includes `fromCache`, `cacheAge`, and `dataAge` (ms since last market tick).
+
+### `yfinance_get_ticker_news`
+
+Fetch recent news articles and press releases for one or more stocks. Results are cached for **2 minutes**.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbols` | string[] | Yes | One or more ticker symbols (max 20, e.g. `["AAPL", "NVDA"]`) |
+| `no_cache` | boolean | No | Bypass the 2-minute cache and fetch fresh headlines; result is written back to cache (default: `false`) |
+
+**Returns:** [Batch envelope](#batch-response-envelope) where each ticker's `data` is a list of news items with title, summary, publication date, provider, URL, and thumbnail.
 
 ### `yfinance_search`
 
@@ -129,17 +169,18 @@ Run a purpose-built custom screener for opening-session bullish gappers.
 
 ### `yfinance_get_price_history`
 
-Fetch historical price data and optionally generate technical analysis charts.
+Fetch historical OHLCV data for one or more tickers, with optional chart generation for single-ticker calls. Tabular results cached for **15 minutes**.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `symbol` | string | Yes | Stock ticker symbol |
+| `symbols` | string[] | Yes | One or more ticker symbols (max 20, e.g. `["AAPL", "MSFT"]`). `chart_type` only applies when exactly one symbol is provided. |
 | `period` | string | No | Time range — `1d`, `5d`, `1mo`, `3mo`, `6mo`, `1y`, `2y`, `5y`, `10y`, `ytd`, `max` (default: `1mo`) |
 | `interval` | string | No | Data granularity — `1m`, `2m`, `5m`, `15m`, `30m`, `60m`, `90m`, `1h`, `1d`, `5d`, `1wk`, `1mo`, `3mo` (default: `1d`) |
-| `chart_type` | string | No | Chart to generate (omit for tabular data) |
-| `prepost` | boolean | No | Include pre-market and post-market data when available (default: `false`; useful with intraday requests like `period="1d"`, `interval="1m"`) |
+| `chart_type` | string | No | Chart to generate — single symbol only (omit for tabular data) |
+| `prepost` | boolean | No | Include pre-market and post-market data (default: `false`) |
+| `no_cache` | boolean | No | Bypass the 15-minute cache and fetch fresh data; result is written back to cache (default: `false`) |
 
-**Chart types:**
+**Chart types (single symbol only):**
 
 | Value | Description |
 |-------|-------------|
@@ -148,19 +189,20 @@ Fetch historical price data and optionally generate technical analysis charts.
 | `"volume_profile"` | Candlestick chart with volume distribution by price level |
 
 **Returns:**
-- Without `chart_type`: Markdown table with Date, Open, High, Low, Close, Volume, Dividends, and Stock Splits columns.
-- With `chart_type`: Base64-encoded WebP image for efficient token usage.
+- Single symbol without `chart_type` or multi-symbol: [Batch envelope](#batch-response-envelope) where each ticker's `data` is a Markdown OHLCV table (Date, Open, High, Low, Close, Volume, Dividends, Stock Splits).
+- Single symbol with `chart_type`: Base64-encoded WebP image.
 
 ### `yfinance_get_financials`
 
-Fetch financial statements (income statement, balance sheet, and cash flow) with historical data.
+Fetch financial statements (income statement, balance sheet, and cash flow) for one or more tickers. Results cached for **6 hours**.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `symbol` | string | Yes | Stock ticker symbol |
+| `symbols` | string[] | Yes | One or more ticker symbols (max 10, e.g. `["AAPL", "MSFT"]`) |
 | `frequency` | string | No | `"annual"` (yearly), `"quarterly"` (quarterly), or `"ttm"` (trailing twelve months). Default: `"annual"` |
+| `no_cache` | boolean | No | Bypass the 6-hour cache and fetch fresh statements; result is written back to cache (default: `false`) |
 
-**Returns:** JSON object with income statement, balance sheet, and cash flow data for each reporting period.
+**Returns:** [Batch envelope](#batch-response-envelope) where each ticker's `data` contains income statement, balance sheet, and cash flow keyed by reporting period date.
 
 - **Income Statement fields**: EBIT, Net Income, Tax Provision, Pretax Income, Interest Expense, Total Revenue, Operating Income, EBITDA, Normalized Income
 - **Balance Sheet fields**: Stockholders Equity, Total Debt, Cash And Cash Equivalents, Invested Capital, Net Debt, Total Assets, Total Liabilities Net Minority Interest, Net Tangible Assets, Tangible Book Value
@@ -220,14 +262,15 @@ Fetch option chain data (calls and puts) for a stock with available strike price
 
 ### `yfinance_get_earnings`
 
-Fetch earnings beat/miss history, forward EPS/revenue estimates, and EPS revision trends.
+Fetch earnings beat/miss history, forward EPS/revenue estimates, and EPS revision trends for one or more tickers. Results cached for **1 hour**.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `NVDA`) |
-| `history_limit` | number | No | Number of past/future earnings dates to return (max `100`). Default `12` (~3 years) |
+| `symbols` | string[] | Yes | One or more ticker symbols (max 20, e.g. `["AAPL", "NVDA"]`) |
+| `history_limit` | number | No | Number of past/future earnings dates to return per ticker (max `100`). Default `12` (~3 years) |
+| `no_cache` | boolean | No | Bypass the 1-hour cache and fetch fresh estimates; result is written back to cache (default: `false`) |
 
-**Returns:** JSON object with:
+**Returns:** [Batch envelope](#batch-response-envelope) where each ticker's `data` contains:
 - **`earnings_dates`** — Historical and upcoming earnings with EPS Estimate, Reported EPS, and Surprise(%)
 - **`earnings_estimate`** — Forward EPS estimates for current quarter (`0q`), next quarter (`+1q`), current year (`0y`), next year (`+1y`) with analyst count, avg, low, high, yearAgoEps, growth
 - **`revenue_estimate`** — Same structure as `earnings_estimate` but for revenue
@@ -236,14 +279,15 @@ Fetch earnings beat/miss history, forward EPS/revenue estimates, and EPS revisio
 
 ### `yfinance_get_analyst`
 
-Fetch analyst consensus breakdown, price targets, and upgrade/downgrade history.
+Fetch analyst consensus breakdown, price targets, and upgrade/downgrade history for one or more tickers. Results cached for **1 hour**.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `NVDA`) |
-| `upgrades_limit` | number | No | Number of recent firm upgrades/downgrades to return. Default `20` |
+| `symbols` | string[] | Yes | One or more ticker symbols (max 20, e.g. `["AAPL", "NVDA"]`) |
+| `upgrades_limit` | number | No | Number of recent firm upgrades/downgrades to return per ticker. Default `20` |
+| `no_cache` | boolean | No | Bypass the 1-hour cache and fetch fresh analyst data; result is written back to cache (default: `false`) |
 
-**Returns:** JSON object with:
+**Returns:** [Batch envelope](#batch-response-envelope) where each ticker's `data` contains:
 - **`price_targets`** — Consensus price target: current, low, high, mean, median
 - **`recommendations`** — Period-by-period breakdown with strongBuy, buy, hold, sell, strongSell counts. Most recent period reflects current analyst consensus
 - **`upgrades_downgrades`** — Firm-level grade changes with firm name, fromGrade, toGrade, and action (up/down/init/reit)

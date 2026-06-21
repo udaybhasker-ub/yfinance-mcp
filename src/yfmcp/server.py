@@ -46,6 +46,7 @@ from yfmcp.utils import create_error_response
 from yfmcp.utils import dump_json
 from yfmcp.yf_runner import _RETRYABLE_YFINANCE_EXCEPTIONS
 from yfmcp.yf_runner import _create_retryable_error_response
+from yfmcp.yf_runner import _get_ticker
 from yfmcp.yf_runner import _is_retryable_yfinance_error
 from yfmcp.yf_runner import _run_yf
 from yfmcp.yf_runner import _select_retryable_exception
@@ -208,6 +209,10 @@ async def get_quote(
             ),
         ),
     ] = None,
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass the 1-minute cache and fetch fresh data. The result is written back to cache."),
+    ] = False,
 ) -> str:
     """Batch quote fetch for one or more tickers with an analysis-ready field set.
 
@@ -237,7 +242,7 @@ async def get_quote(
         "summary": { "totalRequested": 1, "totalReturned": 1, "errors": [] }
       }
     """
-    return dump_json(await QuoteFetcher.fetch_batch(symbols, fields))
+    return dump_json(await QuoteFetcher.fetch_batch(symbols, fields, no_cache=no_cache))
 
 
 @mcp.tool(
@@ -256,12 +261,16 @@ async def get_ticker_news(
         Field(
             description=(
                 "One or more stock ticker symbols, e.g. ['AAPL', 'GOOGL']. "
-                "Up to 20 tickers per call. Results cached for 5 minutes."
+                "Up to 20 tickers per call. Results cached for 2 minutes."
             ),
             min_length=1,
             max_length=20,
         ),
     ],
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass the 2-minute cache and fetch fresh headlines. The result is written back to cache."),
+    ] = False,
 ) -> str:
     """Fetch recent news articles and press releases for one or more stocks.
 
@@ -288,7 +297,7 @@ async def get_ticker_news(
 
     Use this to track company announcements, market sentiment, and breaking news.
     """
-    return dump_json(await news_processor.run(symbols))
+    return dump_json(await news_processor.run(symbols, no_cache=no_cache))
 
 
 @mcp.tool(
@@ -902,6 +911,10 @@ async def get_price_history(
         bool,
         Field(description="Include pre-market and post-market data when available"),
     ] = False,
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass the 15-minute cache and fetch fresh data. The result is written back to cache."),
+    ] = False,
 ) -> str | ImageContent:
     """Fetch historical price data for one or more tickers, with optional chart for single-ticker calls.
 
@@ -926,7 +939,7 @@ async def get_price_history(
     if len(symbols) == 1 and chart_type is not None:
         symbol = symbols[0].strip().upper()
         try:
-            ticker = await _run_yf(yf.Ticker, symbol)
+            ticker = await _get_ticker(symbol)
             df = await _run_yf(
                 ticker.history,
                 period=period,
@@ -957,7 +970,7 @@ async def get_price_history(
 
     # Batch path — tabular only.
     return dump_json(
-        await price_history_processor.run(symbols, period=period, interval=interval, prepost=prepost)
+        await price_history_processor.run(symbols, no_cache=no_cache, period=period, interval=interval, prepost=prepost)
     )
 
 
@@ -992,6 +1005,10 @@ async def get_financials(
             )
         ),
     ] = "annual",
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass the 6-hour cache and fetch fresh statements. The result is written back to cache."),
+    ] = False,
 ) -> str:
     """Fetch financial statements for one or more tickers (income statement, balance sheet, cash flow).
 
@@ -1014,7 +1031,7 @@ async def get_financials(
     Use the data to analyze trends, calculate ratios, or compare companies across periods.
     Financials update once per quarter; responses are cached for 6 hours.
     """
-    return dump_json(await financials_processor.run(symbols, frequency=frequency))
+    return dump_json(await financials_processor.run(symbols, no_cache=no_cache, frequency=frequency))
 
 
 @mcp.tool(
@@ -1372,6 +1389,10 @@ async def get_earnings(
             le=100,
         ),
     ] = 12,
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass the 1-hour cache and fetch fresh estimates. The result is written back to cache."),
+    ] = False,
 ) -> str:
     """Fetch earnings beat/miss history, forward EPS/revenue estimates, and revision trends for one or more tickers.
 
@@ -1395,7 +1416,7 @@ async def get_earnings(
 
     Useful for pre-earnings sweeps across a watchlist. Results cached for 1 hour.
     """
-    return dump_json(await earnings_processor.run(symbols, history_limit=history_limit))
+    return dump_json(await earnings_processor.run(symbols, no_cache=no_cache, history_limit=history_limit))
 
 
 @mcp.tool(
@@ -1424,6 +1445,10 @@ async def get_analyst(
         int,
         Field(description="Number of recent firm upgrades/downgrades to return per ticker. Default 20.", ge=1, le=200),
     ] = 20,
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass the 1-hour cache and fetch fresh analyst data. The result is written back to cache."),
+    ] = False,
 ) -> str:
     """Fetch analyst consensus, price targets, and upgrade/downgrade history for one or more tickers.
 
@@ -1445,4 +1470,4 @@ async def get_analyst(
 
     Useful for watchlist-wide consensus sweeps. Results cached for 1 hour.
     """
-    return dump_json(await analyst_processor.run(symbols, upgrades_limit=upgrades_limit))
+    return dump_json(await analyst_processor.run(symbols, no_cache=no_cache, upgrades_limit=upgrades_limit))

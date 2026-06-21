@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from typing import Any
 
-import yfinance as yf
 from loguru import logger
 
 from yfmcp.batch import BatchProcessor
 from yfmcp.batch import TtlCache
 from yfmcp.yf_runner import _RETRYABLE_YFINANCE_EXCEPTIONS
+from yfmcp.yf_runner import _get_ticker
 from yfmcp.yf_runner import _is_rate_limit_error
 from yfmcp.yf_runner import _run_yf
 
@@ -29,7 +29,7 @@ async def _fetch_analyst(  # noqa: C901
 ) -> dict[str, Any]:
     """Fetch analyst consensus, price targets, and upgrade/downgrade history."""
     try:
-        ticker = await _run_yf(yf.Ticker, symbol)
+        ticker = await _get_ticker(symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         if _is_rate_limit_error(exc):
             return {"error": "Rate limit reached — try again later"}

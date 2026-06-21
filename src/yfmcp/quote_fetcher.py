@@ -3,6 +3,11 @@
 Mirrors the structure of FinMCP's QuoteTools class: all field definitions, timestamp
 handling, and per-ticker/batch fetch logic live here.  The MCP tool function in
 server.py is a thin wrapper that calls ``QuoteFetcher.fetch_batch``.
+
+A 1-minute in-memory cache (``_quote_cache``) protects against burst calls from AI
+skills that invoke get_quote alongside get_analyst / get_earnings within the same
+analysis session.  Pass ``no_cache=True`` to bypass the read and force a live fetch
+(the fresh result is still written back to cache).
 """
 
 from __future__ import annotations
@@ -13,11 +18,15 @@ import time
 from datetime import datetime
 from typing import Any
 
-import yfinance as yf
-
+from yfmcp.batch import TtlCache
 from yfmcp.yf_runner import _RETRYABLE_YFINANCE_EXCEPTIONS
+from yfmcp.yf_runner import _get_ticker
 from yfmcp.yf_runner import _is_rate_limit_error
 from yfmcp.yf_runner import _run_yf
+
+_QUOTE_CACHE_TTL_SECONDS = 60  # 1 minute
+
+_quote_cache = TtlCache(ttl_seconds=_QUOTE_CACHE_TTL_SECONDS)
 
 
 class QuoteFetcher:
@@ -115,10 +124,23 @@ class QuoteFetcher:
         return data
 
     @classmethod
-    async def fetch_single(cls, symbol: str, fields: list[str] | None) -> dict[str, Any]:
-        """Fetch ticker.info for one symbol and return a FinMCP-shaped result dict."""
+    async def fetch_single(cls, symbol: str, fields: list[str] | None, *, no_cache: bool = False) -> dict[str, Any]:
+        """Fetch ticker.info for one symbol and return a FinMCP-shaped result dict.
+
+        Results are cached for ``_QUOTE_CACHE_TTL_SECONDS`` (1 minute).  Pass
+        ``no_cache=True`` to skip the cache read and force a live fetch; the
+        fresh result is still written back to cache.
+        """
+        cache_kwargs: dict[str, Any] = {"fields": tuple(fields) if fields else ()}
+        if not no_cache:
+            cached = await _quote_cache.get(symbol, cache_kwargs)
+            if cached is not None:
+                value, cached_at = cached
+                age_seconds = int(time.monotonic() - cached_at)
+                return {**value, "meta": {**value.get("meta", {}), "fromCache": True, "cacheAge": age_seconds}}
+
         try:
-            ticker = await _run_yf(yf.Ticker, symbol)
+            ticker = await _get_ticker(symbol)
             info = await _run_yf(lambda: ticker.info)
         except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
             if _is_rate_limit_error(exc):
@@ -149,17 +171,27 @@ class QuoteFetcher:
         elif data_age_ms > cls._FIVE_MIN_MS:
             warnings.append("Data may not be real-time (5+ minutes old)")
 
-        return {
+        result = {
             "data": data,
             "meta": {
                 "dataAge": data_age_ms,
                 "completenessScore": completeness,
+                "fromCache": False,
+                "cacheAge": 0,
                 "warnings": warnings,
             },
         }
+        await _quote_cache.set(symbol, cache_kwargs, result)
+        return result
 
     @classmethod
-    async def fetch_batch(cls, symbols: list[str], fields: list[str] | None) -> dict[str, Any]:
+    async def fetch_batch(
+        cls,
+        symbols: list[str],
+        fields: list[str] | None,
+        *,
+        no_cache: bool = False,
+    ) -> dict[str, Any]:
         """Fetch quotes for multiple symbols in batches, returning a FinMCP-shaped envelope."""
         results: dict[str, Any] = {}
         errors: list[dict[str, str]] = []
@@ -169,7 +201,7 @@ class QuoteFetcher:
 
         for batch_idx, batch in enumerate(batches):
             for symbol in batch:
-                result = await cls.fetch_single(symbol, fields)
+                result = await cls.fetch_single(symbol, fields, no_cache=no_cache)
                 if "error" in result:
                     errors.append({"symbol": symbol, "error": result["error"]})
                 else:
