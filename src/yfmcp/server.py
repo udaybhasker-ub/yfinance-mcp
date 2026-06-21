@@ -16,15 +16,20 @@ from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from pydantic import Field
 
+from yfmcp.analyst_fetcher import processor as analyst_processor
 from yfmcp.auth import SharedSecretOAuthProvider
 from yfmcp.chart import generate_chart
+from yfmcp.earnings_fetcher import processor as earnings_processor
+from yfmcp.financials_fetcher import processor as financials_processor
 from yfmcp.industry import SECTOR_INDUSTY_MAPPING
 from yfmcp.industry import _gather_industry_tables
 from yfmcp.industry import _sector_key
 from yfmcp.logging import _logged_tool
+from yfmcp.news_fetcher import processor as news_processor
 from yfmcp.options import _create_option_chain_fetch_error
 from yfmcp.options import _create_option_dates_fetch_error
 from yfmcp.options import _fetch_option_chain_for_date
+from yfmcp.price_history_fetcher import processor as price_history_processor
 from yfmcp.quote_fetcher import QuoteFetcher
 from yfmcp.screener import build_screener_query
 from yfmcp.screener import filter_us_currency_quotes
@@ -246,44 +251,44 @@ async def get_quote(
 )
 @_logged_tool
 async def get_ticker_news(
-    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'GOOGL']. "
+                "Up to 20 tickers per call. Results cached for 5 minutes."
+            ),
+            min_length=1,
+            max_length=20,
+        ),
+    ],
 ) -> str:
-    """Fetch recent news articles and press releases for a specific stock.
+    """Fetch recent news articles and press releases for one or more stocks.
 
-    Returns JSON array where each news item has:
+    Returns a batched envelope keyed by ticker:
+
+        {
+          "results": {
+            "AAPL": {
+              "data": [<article>, ...],
+              "meta": {"articleCount": 8, "fromCache": false, "cacheAge": 0, "warnings": []}
+            }
+          },
+          "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []}
+        }
+
+    Each article object contains:
     - id: Unique article identifier
-    - content: Object containing:
-        - title: Article headline
-        - summary: Brief article summary
-        - pubDate: Publication date (ISO 8601 format)
-        - provider: Object with displayName (e.g., "Yahoo Finance") and url
-        - canonicalUrl: Object with article url, site, region, lang
-        - thumbnail: Object with image URLs and resolutions
-        - contentType: Type of content (e.g., "STORY", "VIDEO")
+    - content.title: Article headline
+    - content.summary: Brief article summary
+    - content.pubDate: Publication date (ISO 8601)
+    - content.provider.displayName: News source name
+    - content.canonicalUrl.url: Article URL
+    - content.contentType: "STORY", "VIDEO", etc.
 
     Use this to track company announcements, market sentiment, and breaking news.
     """
-    try:
-        ticker = await _run_yf(yf.Ticker, symbol)
-        news = await _run_yf(ticker.get_news)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(f"fetching news for '{symbol}'", exc, {"symbol": symbol})
-    except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch news for '{symbol}'. Verify the symbol is correct.",
-            error_code="API_ERROR",
-            details={"symbol": symbol, "exception": str(exc)},
-        )
-
-    if not news:
-        return create_error_response(
-            f"No news articles available for '{symbol}'. "
-            "This may indicate an invalid symbol or no recent news coverage.",
-            error_code="NO_DATA",
-            details={"symbol": symbol},
-        )
-
-    return dump_json(news)
+    return dump_json(await news_processor.run(symbols))
 
 
 @mcp.tool(
@@ -850,7 +855,18 @@ async def get_top(
 )
 @_logged_tool
 async def get_price_history(
-    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'MSFT']. "
+                "Up to 20 tickers per call. Results cached for 15 minutes. "
+                "chart_type is only supported when exactly one symbol is provided."
+            ),
+            min_length=1,
+            max_length=20,
+        ),
+    ],
     period: Annotated[
         Period,
         Field(
@@ -874,11 +890,11 @@ async def get_price_history(
         ChartType | None,
         Field(
             description=(
-                "Optional visualization: "
+                "Optional visualization (single-symbol only): "
                 "'price_volume' (candlestick chart with volume bars), "
                 "'vwap' (Volume Weighted Average Price overlay), "
                 "'volume_profile' (volume distribution by price level). "
-                "Omit for tabular data"
+                "Ignored when multiple symbols are provided."
             )
         ),
     ] = None,
@@ -887,73 +903,62 @@ async def get_price_history(
         Field(description="Include pre-market and post-market data when available"),
     ] = False,
 ) -> str | ImageContent:
-    """Fetch historical price data and optionally generate technical analysis charts.
+    """Fetch historical price data for one or more tickers, with optional chart for single-ticker calls.
 
-    When chart_type is None, returns Markdown table with columns:
-    - Date: Trading date (index)
-    - Open: Opening price
-    - High: Highest price
-    - Low: Lowest price
-    - Close: Closing price
-    - Volume: Trading volume
-    - Dividends: Dividend payments (if any)
-    - Stock Splits: Split events (if any)
+    Single-ticker mode (one symbol):
+    - When chart_type is None, returns a JSON envelope with a Markdown table in ``data``.
+    - When chart_type is set, returns the chart image directly (ImageContent).
 
-    When chart_type is specified, returns a chart image:
+    Multi-ticker mode (two or more symbols):
+    - Always returns a JSON envelope keyed by ticker; chart_type is ignored.
+    - Each ticker's ``data`` field contains its Markdown OHLCV table.
+
+    Markdown table columns: Date, Open, High, Low, Close, Volume, Dividends, Stock Splits.
+
+    Chart types (single-symbol only):
     - 'price_volume': Candlestick chart with volume bars
     - 'vwap': Price with Volume Weighted Average Price overlay
     - 'volume_profile': Volume distribution by price level
 
-    Set prepost=True to include pre-market and post-market data when available.
-
-    Note: Not all period/interval combinations are valid. Minute intervals (1m, 5m, etc.)
-    only work with short periods (1d, 5d).
+    Note: Minute intervals (1m, 5m, etc.) only work with short periods (1d, 5d).
     """
-    try:
-        ticker = await _run_yf(yf.Ticker, symbol)
-        df = await _run_yf(
-            ticker.history,
-            period=period,
-            interval=interval,
-            prepost=prepost,
-            rounding=True,
-        )
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(
-            f"fetching price history for '{symbol}'",
-            exc,
-            {"symbol": symbol, "period": period, "interval": interval, "prepost": prepost},
-        )
-    except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch price history for '{symbol}'. "
-            "Verify the symbol is correct and the period/interval combination is valid.",
-            error_code="API_ERROR",
-            details={
-                "symbol": symbol,
-                "period": period,
-                "interval": interval,
-                "prepost": prepost,
-                "exception": str(exc),
-            },
-        )
+    # Single-symbol + chart_type: bypass the batch path and return an image.
+    if len(symbols) == 1 and chart_type is not None:
+        symbol = symbols[0].strip().upper()
+        try:
+            ticker = await _run_yf(yf.Ticker, symbol)
+            df = await _run_yf(
+                ticker.history,
+                period=period,
+                interval=interval,
+                prepost=prepost,
+                rounding=True,
+            )
+        except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+            return _create_retryable_error_response(
+                f"fetching price history for '{symbol}'",
+                exc,
+                {"symbol": symbol, "period": period, "interval": interval},
+            )
+        except Exception as exc:
+            return create_error_response(
+                f"Failed to fetch price history for '{symbol}'. "
+                "Verify the symbol is correct and the period/interval combination is valid.",
+                error_code="API_ERROR",
+                details={"symbol": symbol, "period": period, "interval": interval, "exception": str(exc)},
+            )
+        if df.empty:
+            return create_error_response(
+                f"No price data for '{symbol}' with period='{period}' interval='{interval}'.",
+                error_code="NO_DATA",
+                details={"symbol": symbol, "period": period, "interval": interval},
+            )
+        return await asyncio.to_thread(generate_chart, symbol=symbol, df=df, chart_type=chart_type)
 
-    if df.empty:
-        return create_error_response(
-            f"No price data available for '{symbol}' with period='{period}' and interval='{interval}'. "
-            "Common issues: (1) Invalid symbol, (2) Incompatible period/interval combination "
-            "(e.g., '1m' interval requires '1d' or '5d' period), (3) Market holidays or insufficient history. "
-            "Try a longer period or daily interval.",
-            error_code="NO_DATA",
-            details={"symbol": symbol, "period": period, "interval": interval, "prepost": prepost},
-        )
-
-    if chart_type is None:
-        return df.to_markdown()
-
-    # generate_chart does matplotlib rendering + WebP encoding, which is CPU-bound and slow
-    # enough to block the event loop for every other concurrent request if run inline.
-    return await asyncio.to_thread(generate_chart, symbol=symbol, df=df, chart_type=chart_type)
+    # Batch path — tabular only.
+    return dump_json(
+        await price_history_processor.run(symbols, period=period, interval=interval, prepost=prepost)
+    )
 
 
 @mcp.tool(
@@ -967,7 +972,17 @@ async def get_price_history(
 )
 @_logged_tool
 async def get_financials(
-    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'MSFT']. "
+                "Up to 10 tickers per call. Results cached for 6 hours."
+            ),
+            min_length=1,
+            max_length=10,
+        ),
+    ],
     frequency: Annotated[
         str,
         Field(
@@ -978,129 +993,28 @@ async def get_financials(
         ),
     ] = "annual",
 ) -> str:
-    """Fetch financial statements (income statement, balance sheet, and cash flow) with historical data.
+    """Fetch financial statements for one or more tickers (income statement, balance sheet, cash flow).
 
-    Returns JSON with income statement, balance sheet, and cash flow data across reporting periods.
+    Returns a batched envelope keyed by ticker:
 
-    Use the data to analyze trends, calculate ratios, or compare periods.
+        {
+          "results": {
+            "AAPL": {
+              "data": {
+                "income_statement": {"Total Revenue": {"2024-09-28": 391035000000, ...}, ...},
+                "balance_sheet": {"Total Assets": {...}, ...},
+                "cash_flow": {"Free Cash Flow": {...}, ...}
+              },
+              "meta": {"frequency": "annual", "fromCache": false, "cacheAge": 0, "warnings": []}
+            }
+          },
+          "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []}
+        }
+
+    Use the data to analyze trends, calculate ratios, or compare companies across periods.
+    Financials update once per quarter; responses are cached for 6 hours.
     """
-    try:
-        ticker = await _run_yf(yf.Ticker, symbol)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(f"fetching financials for '{symbol}'", exc, {"symbol": symbol})
-    except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch financials for '{symbol}'. Verify the symbol is correct.",
-            error_code="API_ERROR",
-            details={"symbol": symbol, "exception": str(exc)},
-        )
-
-    income_stmt = None
-    balance_sheet = None
-    cash_flow = None
-
-    if frequency not in {"annual", "quarterly", "ttm"}:
-        return create_error_response(
-            f"Invalid frequency '{frequency}'. Valid options: 'annual', 'quarterly', 'ttm'.",
-            error_code="INVALID_PARAMS",
-            details={"frequency": frequency, "valid_options": ["annual", "quarterly", "ttm"]},
-        )
-
-    try:
-        if frequency == "annual":
-            income_stmt = await _run_yf(lambda: ticker.income_stmt)
-            balance_sheet = await _run_yf(lambda: ticker.balance_sheet)
-            cash_flow = await _run_yf(lambda: ticker.cashflow)
-        elif frequency == "quarterly":
-            income_stmt = await _run_yf(lambda: ticker.quarterly_income_stmt)
-            balance_sheet = await _run_yf(lambda: ticker.quarterly_balance_sheet)
-            cash_flow = await _run_yf(lambda: ticker.quarterly_cashflow)
-        else:
-            income_stmt = await _run_yf(lambda: ticker.ttm_income_stmt)
-            balance_sheet = None  # TTM balance sheet not directly available
-            cash_flow = None  # TTM cash flow not directly available
-
-        result = _build_financials_response(income_stmt, balance_sheet, cash_flow)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(
-            f"fetching financials for '{symbol}'",
-            exc,
-            {"symbol": symbol, "frequency": frequency},
-        )
-    except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch financials for '{symbol}'. Verify the symbol is correct.",
-            error_code="API_ERROR",
-            details={"symbol": symbol, "frequency": frequency, "exception": str(exc)},
-        )
-    if not result:
-        return create_error_response(
-            f"No financial data available for '{symbol}' with frequency='{frequency}'.",
-            error_code="NO_DATA",
-            details={"symbol": symbol, "frequency": frequency},
-        )
-
-    return dump_json(result)
-
-
-def _build_financials_response(income_stmt, balance_sheet, cash_flow=None) -> dict:
-    """Build financials response from income statement, balance sheet, and cash flow DataFrames."""
-    result = {}
-
-    if income_stmt is not None and not income_stmt.empty:
-        income_fields = [
-            "EBIT",
-            "Net Income",
-            "Tax Provision",
-            "Pretax Income",
-            "Interest Expense",
-            "Total Revenue",
-            "Operating Income",
-            "EBITDA",
-            "Normalized Income",
-        ]
-        available_income_fields = [f for f in income_fields if f in income_stmt.index]
-        result["income_statement"] = {}
-        for field in available_income_fields:
-            result["income_statement"][field] = {
-                str(col.date()): income_stmt.loc[field, col] for col in income_stmt.columns
-            }
-
-    if balance_sheet is not None and not balance_sheet.empty:
-        balance_fields = [
-            "Stockholders Equity",
-            "Total Debt",
-            "Cash And Cash Equivalents",
-            "Invested Capital",
-            "Net Debt",
-            "Total Assets",
-            "Total Liabilities Net Minority Interest",
-            "Net Tangible Assets",
-            "Tangible Book Value",
-        ]
-        available_balance_fields = [f for f in balance_fields if f in balance_sheet.index]
-        result["balance_sheet"] = {}
-        for field in available_balance_fields:
-            result["balance_sheet"][field] = {
-                str(col.date()): balance_sheet.loc[field, col] for col in balance_sheet.columns
-            }
-
-    if cash_flow is not None and not cash_flow.empty:
-        cash_flow_fields = [
-            "Operating Cash Flow",
-            "Free Cash Flow",
-            "Capital Expenditure",
-            "Net Income From Continuing Operations",
-            "Depreciation And Amortization",
-            "Change In Working Capital",
-            "Cash Dividends Paid",
-        ]
-        available_cash_flow_fields = [f for f in cash_flow_fields if f in cash_flow.index]
-        result["cash_flow"] = {}
-        for field in available_cash_flow_fields:
-            result["cash_flow"][field] = {str(col.date()): cash_flow.loc[field, col] for col in cash_flow.columns}
-
-    return result
+    return dump_json(await financials_processor.run(symbols, frequency=frequency))
 
 
 @mcp.tool(
@@ -1439,88 +1353,49 @@ def main() -> None:
 )
 @_logged_tool
 async def get_earnings(
-    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'NVDA')")],
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'NVDA']. "
+                "Up to 20 tickers per call. Results cached for 1 hour."
+            ),
+            min_length=1,
+            max_length=20,
+        ),
+    ],
     history_limit: Annotated[
         int,
         Field(
-            description="Number of past/future earnings dates to return (max 100). Default 12 = ~3 years.", ge=1, le=100
+            description="Number of past/future earnings dates to return per ticker (max 100). Default 12 = ~3 years.",
+            ge=1,
+            le=100,
         ),
     ] = 12,
 ) -> str:
-    """Fetch earnings beat/miss history, forward EPS/revenue estimates, and EPS revision trends.
+    """Fetch earnings beat/miss history, forward EPS/revenue estimates, and revision trends for one or more tickers.
 
-    Returns JSON with:
-    - earnings_dates: Historical and upcoming earnings with EPS Estimate, Reported EPS,
-      and Surprise(%) — use this for beat/miss history and upcoming earnings dates.
-    - earnings_estimate: Forward EPS estimates for current quarter (0q), next quarter (+1q),
-      current year (0y), next year (+1y) with analyst count, avg, low, high, yearAgoEps, growth.
-    - revenue_estimate: Same structure as earnings_estimate but for revenue.
-    - eps_trend: How current EPS estimates compare to 7, 30, 60, 90 days ago per period.
-    - eps_revisions: Count of upward/downward analyst EPS revisions over last 7 and 30 days.
+    Returns a batched envelope keyed by ticker:
+
+        {
+          "results": {
+            "AAPL": {
+              "data": {
+                "earnings_dates": {"2024-11-01 ...": {"EPS Estimate": 1.6, "Reported EPS": 1.64, "Surprise(%)": 2.5}},
+                "earnings_estimate": {...},
+                "revenue_estimate": {...},
+                "eps_trend": {...},
+                "eps_revisions": {...}
+              },
+              "meta": {"historyLimit": 12, "fromCache": false, "cacheAge": 0, "warnings": []}
+            }
+          },
+          "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []}
+        }
+
+    Useful for pre-earnings sweeps across a watchlist. Results cached for 1 hour.
     """
-    try:
-        ticker = await _run_yf(yf.Ticker, symbol)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(f"fetching earnings for '{symbol}'", exc, {"symbol": symbol})
-    except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch earnings for '{symbol}'. Verify the symbol is correct.",
-            error_code="API_ERROR",
-            details={"symbol": symbol, "exception": str(exc)},
-        )
-
-    result: dict[str, Any] = {}
-
-    # Historical beat/miss + upcoming dates
-    try:
-        dates_df = await _run_yf(ticker.get_earnings_dates, history_limit)
-        if dates_df is not None and not dates_df.empty:
-            dates_df = dates_df.copy()
-            dates_df.index = dates_df.index.strftime("%Y-%m-%d %H:%M %Z")
-            result["earnings_dates"] = dates_df.to_dict(orient="index")
-    except Exception as exc:
-        logger.warning("Failed to fetch earnings_dates for {}: {}", symbol, exc)
-
-    # Forward EPS estimates (0q, +1q, 0y, +1y)
-    try:
-        ee = await _run_yf(ticker.get_earnings_estimate, True)
-        if ee:
-            result["earnings_estimate"] = ee
-    except Exception as exc:
-        logger.warning("Failed to fetch earnings_estimate for {}: {}", symbol, exc)
-
-    # Forward revenue estimates
-    try:
-        re = await _run_yf(ticker.get_revenue_estimate, True)
-        if re:
-            result["revenue_estimate"] = re
-    except Exception as exc:
-        logger.warning("Failed to fetch revenue_estimate for {}: {}", symbol, exc)
-
-    # EPS trend vs 7/30/60/90 days ago
-    try:
-        et = await _run_yf(ticker.get_eps_trend, True)
-        if et:
-            result["eps_trend"] = et
-    except Exception as exc:
-        logger.warning("Failed to fetch eps_trend for {}: {}", symbol, exc)
-
-    # Revision counts (up/down last 7d and 30d)
-    try:
-        er = await _run_yf(ticker.get_eps_revisions, True)
-        if er:
-            result["eps_revisions"] = er
-    except Exception as exc:
-        logger.warning("Failed to fetch eps_revisions for {}: {}", symbol, exc)
-
-    if not result:
-        return create_error_response(
-            f"No earnings data available for '{symbol}'.",
-            error_code="NO_DATA",
-            details={"symbol": symbol},
-        )
-
-    return dump_json(result)
+    return dump_json(await earnings_processor.run(symbols, history_limit=history_limit))
 
 
 @mcp.tool(
@@ -1534,65 +1409,40 @@ async def get_earnings(
 )
 @_logged_tool
 async def get_analyst(
-    symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'NVDA')")],
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'NVDA']. "
+                "Up to 20 tickers per call. Results cached for 1 hour."
+            ),
+            min_length=1,
+            max_length=20,
+        ),
+    ],
     upgrades_limit: Annotated[
         int,
-        Field(description="Number of recent firm upgrades/downgrades to return. Default 20.", ge=1, le=200),
+        Field(description="Number of recent firm upgrades/downgrades to return per ticker. Default 20.", ge=1, le=200),
     ] = 20,
 ) -> str:
-    """Fetch analyst consensus breakdown, price targets, and upgrade/downgrade history.
+    """Fetch analyst consensus, price targets, and upgrade/downgrade history for one or more tickers.
 
-    Returns JSON with:
-    - price_targets: Consensus price target — current, low, high, mean, median.
-    - recommendations: Period-by-period breakdown with strongBuy, buy, hold, sell,
-      strongSell counts. Most recent period reflects current analyst consensus.
-    - upgrades_downgrades: Firm-level grade changes with firm name, fromGrade,
-      toGrade, and action (up/down/init/reit).
+    Returns a batched envelope keyed by ticker:
+
+        {
+          "results": {
+            "AAPL": {
+              "data": {
+                "price_targets": {"current": 195.0, "low": 160.0, "high": 260.0, "mean": 220.0, "median": 225.0},
+                "recommendations": [{"period": "0m", "strongBuy": 20, "buy": 15, ...}, ...],
+                "upgrades_downgrades": [{"GradeDate": "2024-11-01", "Firm": "...", "toGrade": "Buy", ...}, ...]
+              },
+              "meta": {"upgradesLimit": 20, "fromCache": false, "cacheAge": 0, "warnings": []}
+            }
+          },
+          "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []}
+        }
+
+    Useful for watchlist-wide consensus sweeps. Results cached for 1 hour.
     """
-    try:
-        ticker = await _run_yf(yf.Ticker, symbol)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(f"fetching analyst data for '{symbol}'", exc, {"symbol": symbol})
-    except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch analyst data for '{symbol}'. Verify the symbol is correct.",
-            error_code="API_ERROR",
-            details={"symbol": symbol, "exception": str(exc)},
-        )
-
-    result: dict[str, Any] = {}
-
-    # Consensus price targets (mean, low, high, median, current)
-    try:
-        pt = await _run_yf(ticker.get_analyst_price_targets)
-        if pt:
-            result["price_targets"] = pt
-    except Exception as exc:
-        logger.warning("Failed to fetch analyst_price_targets for {}: {}", symbol, exc)
-
-    # Period-by-period consensus (strongBuy / buy / hold / sell / strongSell)
-    try:
-        rec_df = await _run_yf(ticker.get_recommendations, False)
-        if rec_df is not None and not rec_df.empty:
-            result["recommendations"] = rec_df.to_dict(orient="records")
-    except Exception as exc:
-        logger.warning("Failed to fetch recommendations for {}: {}", symbol, exc)
-
-    # Firm-level upgrade/downgrade history
-    try:
-        ud_df = await _run_yf(ticker.get_upgrades_downgrades, False)
-        if ud_df is not None and not ud_df.empty:
-            ud_df = ud_df.copy().head(upgrades_limit)
-            ud_df.index = ud_df.index.strftime("%Y-%m-%d")
-            result["upgrades_downgrades"] = ud_df.reset_index().to_dict(orient="records")
-    except Exception as exc:
-        logger.warning("Failed to fetch upgrades_downgrades for {}: {}", symbol, exc)
-
-    if not result:
-        return create_error_response(
-            f"No analyst data available for '{symbol}'.",
-            error_code="NO_DATA",
-            details={"symbol": symbol},
-        )
-
-    return dump_json(result)
+    return dump_json(await analyst_processor.run(symbols, upgrades_limit=upgrades_limit))

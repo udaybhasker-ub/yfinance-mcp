@@ -11,8 +11,13 @@ import pandas as pd
 import pytest
 from yfinance.exceptions import YFRateLimitError
 
+from yfmcp.analyst_fetcher import _cache as analyst_cache
+from yfmcp.earnings_fetcher import _cache as earnings_cache
+from yfmcp.financials_fetcher import _build_financials_response
+from yfmcp.financials_fetcher import _cache as financials_cache
 from yfmcp.industry import _industry_key
-from yfmcp.server import _build_financials_response
+from yfmcp.news_fetcher import _cache as news_cache
+from yfmcp.price_history_fetcher import _cache as price_history_cache
 from yfmcp.server import _sector_key
 from yfmcp.server import get_financials
 from yfmcp.server import get_holders
@@ -26,6 +31,16 @@ from yfmcp.server import get_top_mutual_funds
 from yfmcp.server import get_top_performing_companies
 from yfmcp.server import screen
 from yfmcp.server import screen_gappers
+
+
+@pytest.fixture(autouse=True)
+def clear_fetcher_caches() -> None:
+    """Clear all batch-fetcher caches before each test to prevent inter-test contamination."""
+    financials_cache.clear_sync()
+    price_history_cache.clear_sync()
+    earnings_cache.clear_sync()
+    analyst_cache.clear_sync()
+    news_cache.clear_sync()
 
 
 def _financials_df(rows: dict[str, list[int]]) -> pd.DataFrame:
@@ -135,8 +150,8 @@ def test_build_financials_response_ignores_none_and_empty_dataframes() -> None:
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_annual_success(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test annual financials retrieval."""
     mock_ticker_obj = MagicMock()
@@ -146,8 +161,9 @@ async def test_get_financials_annual_success(mock_to_thread: AsyncMock, mock_tic
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_financials("AAPL", "annual")
-    data = json.loads(result)
+    result = await get_financials(["AAPL"], "annual")
+    envelope = json.loads(result)
+    data = envelope["results"]["AAPL"]["data"]
 
     assert data["income_statement"]["Total Revenue"]["2024-12-31"] == 1000
     assert data["balance_sheet"]["Total Assets"]["2023-12-31"] == 4500
@@ -155,8 +171,8 @@ async def test_get_financials_annual_success(mock_to_thread: AsyncMock, mock_tic
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_quarterly_success(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test quarterly financials retrieval."""
     mock_ticker_obj = MagicMock()
@@ -166,8 +182,9 @@ async def test_get_financials_quarterly_success(mock_to_thread: AsyncMock, mock_
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_financials("MSFT", "quarterly")
-    data = json.loads(result)
+    result = await get_financials(["MSFT"], "quarterly")
+    envelope = json.loads(result)
+    data = envelope["results"]["MSFT"]["data"]
 
     assert data["income_statement"]["Operating Income"]["2024-12-31"] == 400
     assert data["balance_sheet"]["Stockholders Equity"]["2023-12-31"] == 2100
@@ -175,8 +192,8 @@ async def test_get_financials_quarterly_success(mock_to_thread: AsyncMock, mock_
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_ttm_success_only_income_statement(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
 ) -> None:
@@ -186,34 +203,37 @@ async def test_get_financials_ttm_success_only_income_statement(
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_financials("NVDA", "ttm")
-    data = json.loads(result)
+    result = await get_financials(["NVDA"], "ttm")
+    envelope = json.loads(result)
+    data = envelope["results"]["NVDA"]["data"]
 
     assert set(data) == {"income_statement"}
     assert data["income_statement"]["EBITDA"]["2024-12-31"] == 700
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_invalid_frequency(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
-    """Test invalid financials frequency returns structured parameter error."""
+    """Test invalid financials frequency surfaces as a per-ticker error."""
     mock_ticker.return_value = MagicMock()
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_financials("AAPL", "monthly")
-    data = json.loads(result)
+    result = await get_financials(["AAPL"], "monthly")
+    envelope = json.loads(result)
 
-    assert data["error_code"] == "INVALID_PARAMS"
-    assert data["details"]["frequency"] == "monthly"
-    assert data["details"]["valid_options"] == ["annual", "quarterly", "ttm"]
+    assert envelope["summary"]["totalReturned"] == 0
+    errors = envelope["summary"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["symbol"] == "AAPL"
+    assert "monthly" in errors[0]["error"] or "Invalid frequency" in errors[0]["error"]
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_no_data(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
-    """Test financials retrieval with no statement data."""
+    """Test financials retrieval with no statement data surfaces as a per-ticker error."""
     mock_ticker_obj = MagicMock()
     mock_ticker_obj.income_stmt = pd.DataFrame()
     mock_ticker_obj.balance_sheet = pd.DataFrame()
@@ -221,11 +241,14 @@ async def test_get_financials_no_data(mock_to_thread: AsyncMock, mock_ticker: Ma
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_financials("EMPTY", "annual")
-    data = json.loads(result)
+    result = await get_financials(["EMPTY"], "annual")
+    envelope = json.loads(result)
 
-    assert data["error_code"] == "NO_DATA"
-    assert data["details"] == {"symbol": "EMPTY", "frequency": "annual"}
+    assert envelope["summary"]["totalReturned"] == 0
+    errors = envelope["summary"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["symbol"] == "EMPTY"
+    assert "No financial data" in errors[0]["error"]
 
 
 @pytest.mark.asyncio
@@ -233,48 +256,51 @@ async def test_get_financials_no_data(mock_to_thread: AsyncMock, mock_ticker: Ma
     "exception",
     [TimeoutError("timed out"), OSError("network unreachable"), YFRateLimitError()],
 )
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_ticker_creation_network_error(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock, exception: Exception
 ) -> None:
-    """Test network errors while creating a ticker return structured network errors."""
+    """Test network errors while creating a ticker surface as per-ticker errors."""
     mock_ticker.side_effect = exception
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_financials("AAPL", "annual")
-    data = json.loads(result)
+    result = await get_financials(["AAPL"], "annual")
+    envelope = json.loads(result)
 
-    assert data["error_code"] == "NETWORK_ERROR"
-    assert data["error"] == _expected_retryable_error("fetching financials for 'AAPL'", exception)
-    assert data["details"]["symbol"] == "AAPL"
-    assert data["details"]["exception"] == str(exception)
+    assert envelope["summary"]["totalReturned"] == 0
+    errors = envelope["summary"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["symbol"] == "AAPL"
+    error_msg = errors[0]["error"]
+    assert "Rate limit" in error_msg or "Temporary network" in error_msg
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.financials_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_financials_statement_read_api_error(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
-    """Test statement read errors return structured API errors."""
+    """Test statement read errors surface as per-ticker errors."""
     mock_ticker.return_value = _FinancialsReadErrorTicker()
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_financials("AAPL", "annual")
-    data = json.loads(result)
+    result = await get_financials(["AAPL"], "annual")
+    envelope = json.loads(result)
 
-    assert data["error_code"] == "API_ERROR"
-    assert data["details"]["symbol"] == "AAPL"
-    assert data["details"]["frequency"] == "annual"
-    assert data["details"]["exception"] == "statement read failed"
+    assert envelope["summary"]["totalReturned"] == 0
+    errors = envelope["summary"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["symbol"] == "AAPL"
+    assert "statement read failed" in errors[0]["error"]
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_price_history_returns_markdown_table_when_chart_type_is_none(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
 ) -> None:
-    """Test price history without chart_type returns DataFrame markdown output."""
+    """Test price history without chart_type returns a batch envelope with a Markdown table."""
     df = pd.DataFrame(
         {
             "Open": [100.0],
@@ -290,19 +316,21 @@ async def test_get_price_history_returns_markdown_table_when_chart_type_is_none(
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_price_history("AAPL", "1mo", "1d", None)
+    result = await get_price_history(["AAPL"], "1mo", "1d", None)
+    envelope = json.loads(result)
+    table = envelope["results"]["AAPL"]["data"]
 
-    assert isinstance(result, str)
-    assert result == df.to_markdown()
-    assert "Open" in result
-    assert "Close" in result
-    assert "|" in result
+    assert isinstance(table, str)
+    assert table == df.to_markdown()
+    assert "Open" in table
+    assert "Close" in table
+    assert "|" in table
     mock_ticker_obj.history.assert_called_once_with(period="1mo", interval="1d", prepost=False, rounding=True)
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_price_history_passes_prepost_to_yfinance(mock_to_thread: AsyncMock, mock_ticker: MagicMock) -> None:
     """Test price history can request pre-market and post-market rows."""
     df = pd.DataFrame(
@@ -320,49 +348,55 @@ async def test_get_price_history_passes_prepost_to_yfinance(mock_to_thread: Asyn
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_price_history("AAPL", "1d", "1m", None, True)
+    result = await get_price_history(["AAPL"], "1d", "1m", None, True)
+    envelope = json.loads(result)
 
-    assert isinstance(result, str)
+    assert envelope["results"]["AAPL"]["data"] == df.to_markdown()
     mock_ticker_obj.history.assert_called_once_with(period="1d", interval="1m", prepost=True, rounding=True)
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
+@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
 async def test_get_price_history_no_data_includes_prepost_detail(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
 ) -> None:
-    """Test no-data errors include the prepost request value."""
+    """Test no-data for a ticker surfaces in the batch envelope errors."""
     mock_ticker_obj = MagicMock()
     mock_ticker_obj.history.return_value = pd.DataFrame()
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_price_history("AAPL", "1d", "1m", None, True)
-    data = json.loads(result)
+    result = await get_price_history(["AAPL"], "1d", "1m", None, True)
+    envelope = json.loads(result)
 
-    assert data["error_code"] == "NO_DATA"
-    assert data["details"] == {"symbol": "AAPL", "period": "1d", "interval": "1m", "prepost": True}
+    assert envelope["summary"]["totalReturned"] == 0
+    errors = envelope["summary"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["symbol"] == "AAPL"
+    assert "No price data" in errors[0]["error"] or "AAPL" in errors[0]["error"]
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
-@patch("yfmcp.server.asyncio.to_thread")
-async def test_get_price_history_api_error_includes_prepost_detail(
+@patch("yfmcp.price_history_fetcher.yf.Ticker")
+@patch("yfmcp.yf_runner.asyncio.to_thread")
+async def test_get_price_history_api_error_surfaces_in_envelope(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
 ) -> None:
-    """Test API errors include the prepost request value."""
+    """Test API errors for a ticker surface in the batch envelope errors."""
     mock_ticker_obj = MagicMock()
     mock_ticker_obj.history.side_effect = RuntimeError("history failed")
     mock_ticker.return_value = mock_ticker_obj
     mock_to_thread.side_effect = _run_to_thread
 
-    result = await get_price_history("AAPL", "1d", "1m", None, True)
-    data = json.loads(result)
+    result = await get_price_history(["AAPL"], "1d", "1m", None, True)
+    envelope = json.loads(result)
 
-    assert data["error_code"] == "API_ERROR"
-    assert data["details"]["prepost"] is True
-    assert data["details"]["exception"] == "history failed"
+    assert envelope["summary"]["totalReturned"] == 0
+    errors = envelope["summary"]["errors"]
+    assert len(errors) == 1
+    assert errors[0]["symbol"] == "AAPL"
+    assert "history failed" in errors[0]["error"]
 
 
 @pytest.mark.asyncio
