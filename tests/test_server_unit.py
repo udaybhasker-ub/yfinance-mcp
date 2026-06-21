@@ -11,8 +11,8 @@ import pandas as pd
 import pytest
 from yfinance.exceptions import YFRateLimitError
 
+from yfmcp.industry import _industry_key
 from yfmcp.server import _build_financials_response
-from yfmcp.server import _industry_key
 from yfmcp.server import _sector_key
 from yfmcp.server import get_financials
 from yfmcp.server import get_holders

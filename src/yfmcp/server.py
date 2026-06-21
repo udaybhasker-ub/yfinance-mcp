@@ -1,10 +1,5 @@
 import asyncio
-import functools
-import inspect
 import os
-import sys
-import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -20,17 +15,20 @@ from mcp.types import ImageContent
 from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from pydantic import Field
-from yfinance.const import SECTOR_INDUSTY_MAPPING
-from yfinance.exceptions import YFRateLimitError
 
 from yfmcp.auth import SharedSecretOAuthProvider
 from yfmcp.chart import generate_chart
+from yfmcp.industry import SECTOR_INDUSTY_MAPPING
+from yfmcp.industry import _gather_industry_tables
+from yfmcp.industry import _sector_key
+from yfmcp.logging import _logged_tool
+from yfmcp.options import _create_option_chain_fetch_error
+from yfmcp.options import _create_option_dates_fetch_error
+from yfmcp.options import _fetch_option_chain_for_date
+from yfmcp.quote_fetcher import QuoteFetcher
 from yfmcp.screener import build_screener_query
 from yfmcp.screener import filter_us_currency_quotes
 from yfmcp.screener import truncate_quotes
-
-_EQUITY_FILTER_OVERFETCH_FACTOR = 4
-_YAHOO_SCREENER_MAX_SIZE = 250
 from yfmcp.types import ChartType
 from yfmcp.types import Interval
 from yfmcp.types import OptionChainType
@@ -41,9 +39,14 @@ from yfmcp.types import Sector
 from yfmcp.types import TopType
 from yfmcp.utils import create_error_response
 from yfmcp.utils import dump_json
+from yfmcp.yf_runner import _RETRYABLE_YFINANCE_EXCEPTIONS
+from yfmcp.yf_runner import _create_retryable_error_response
+from yfmcp.yf_runner import _is_retryable_yfinance_error
+from yfmcp.yf_runner import _run_yf
+from yfmcp.yf_runner import _select_retryable_exception
 
-logger.remove()
-logger.add(sys.stderr, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
+_EQUITY_FILTER_OVERFETCH_FACTOR = 4
+_YAHOO_SCREENER_MAX_SIZE = 250
 
 _base_url = os.environ.get("MCP_PUBLIC_URL") or f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')}"
 
@@ -101,184 +104,6 @@ async def favicon_png(request: Any) -> Any:
     from starlette.responses import FileResponse
 
     return FileResponse(_ASSETS_DIR / "favicon.png", media_type="image/png")
-
-
-_RETRYABLE_YFINANCE_EXCEPTIONS: tuple[type[Exception], ...] = (
-    ConnectionError,
-    TimeoutError,
-    OSError,
-    YFRateLimitError,
-)
-
-# yfinance's YfData is a process-wide singleton: every Ticker/Search/Sector call shares one
-# curl_cffi session and cookie/crumb lock across all threads. Firing many concurrent tool
-# calls at it causes them to serialize on that shared session and choke each other rather
-# than running as independent requests. Cap how many run at once and bound each with a
-# timeout so a stalled call fails fast instead of hanging the MCP client.
-_YF_CALL_CONCURRENCY = asyncio.Semaphore(4)
-_YF_CALL_TIMEOUT_SECONDS = 30.0
-
-
-def _describe_yf_call(func, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-    name = getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or repr(func)
-    parts = [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
-    return f"{name}({', '.join(parts)})" if parts else name
-
-
-async def _run_yf(func, *args, **kwargs):
-    call_desc = _describe_yf_call(func, args, kwargs)
-    async with _YF_CALL_CONCURRENCY:
-        start = time.monotonic()
-        try:
-            result = await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=_YF_CALL_TIMEOUT_SECONDS)
-        except Exception as exc:
-            logger.error(
-                "yahoo_call={} status=failed duration={:.2f}s error={}: {}",
-                call_desc,
-                time.monotonic() - start,
-                type(exc).__name__,
-                exc,
-            )
-            raise
-        else:
-            logger.info(
-                "yahoo_call={} status=success duration={:.2f}s",
-                call_desc,
-                time.monotonic() - start,
-            )
-            return result
-
-
-def _format_call_params(func, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-    try:
-        bound = inspect.signature(func).bind(*args, **kwargs)
-    except TypeError:
-        return str(kwargs or args)
-    return ", ".join(f"{name}={value!r}" for name, value in bound.arguments.items())
-
-
-def _logged_tool(func):
-    """Log every tool invocation's params, outcome, and duration.
-
-    Without this, only the warning/error paths inside individual tools ever logged
-    anything, so successful calls (the vast majority) were invisible in Railway logs.
-    """
-    tool_name = func.__name__
-
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        params = _format_call_params(func, args, kwargs)
-        start = time.monotonic()
-        try:
-            result = await func(*args, **kwargs)
-        except asyncio.CancelledError:
-            logger.warning(
-                "tool={} params=({}) status=suspended duration={:.2f}s",
-                tool_name,
-                params,
-                time.monotonic() - start,
-            )
-            raise
-        except Exception as exc:
-            logger.error(
-                "tool={} params=({}) status=failed duration={:.2f}s error={}",
-                tool_name,
-                params,
-                time.monotonic() - start,
-                exc,
-            )
-            raise
-        else:
-            logger.info(
-                "tool={} params=({}) status=success duration={:.2f}s",
-                tool_name,
-                params,
-                time.monotonic() - start,
-            )
-            return result
-
-    return wrapper
-
-
-def _is_retryable_yfinance_error(exc: BaseException) -> bool:
-    return isinstance(exc, _RETRYABLE_YFINANCE_EXCEPTIONS)
-
-
-def _is_rate_limit_error(exc: BaseException) -> bool:
-    return isinstance(exc, YFRateLimitError)
-
-
-def _create_retryable_error_response(action: str, exc: BaseException, details: dict[str, Any]) -> str:
-    if _is_rate_limit_error(exc):
-        message = f"Rate limit reached while {action}. Try again later."
-    else:
-        message = f"Temporary network issue while {action}. Try again later."
-
-    return create_error_response(message, error_code="NETWORK_ERROR", details={**details, "exception": str(exc)})
-
-
-def _select_retryable_exception(exceptions: list[Exception]) -> BaseException:
-    rate_limit_exception = next((exc for exc in exceptions if _is_rate_limit_error(exc)), None)
-    return rate_limit_exception or exceptions[0]
-
-
-def _create_option_dates_fetch_error(symbol: str, exc: Exception, api_message: str) -> str:
-    if _is_retryable_yfinance_error(exc):
-        return _create_retryable_error_response(f"fetching option dates for '{symbol}'", exc, {"symbol": symbol})
-
-    return create_error_response(
-        api_message,
-        error_code="API_ERROR",
-        details={"symbol": symbol, "exception": str(exc)},
-    )
-
-
-def _create_option_chain_fetch_error(
-    symbol: str,
-    dates_to_fetch: list[str],
-    fetch_errors: list[tuple[str, Exception]],
-) -> str:
-    failed_dates = [date for date, _ in fetch_errors]
-
-    if len(dates_to_fetch) == 1:
-        failed_date, exc = fetch_errors[0]
-        if _is_retryable_yfinance_error(exc):
-            return _create_retryable_error_response(
-                f"fetching option chain for '{symbol}' on '{failed_date}'",
-                exc,
-                {"symbol": symbol, "expiration_date": failed_date},
-            )
-
-        return create_error_response(
-            f"Failed to fetch option chain for '{symbol}' on '{failed_date}'.",
-            error_code="API_ERROR",
-            details={"symbol": symbol, "expiration_date": failed_date, "exception": str(exc)},
-        )
-
-    retryable_exceptions = [exc for _, exc in fetch_errors if _is_retryable_yfinance_error(exc)]
-
-    if retryable_exceptions:
-        return _create_retryable_error_response(
-            f"fetching option chain for '{symbol}'",
-            _select_retryable_exception(retryable_exceptions),
-            {
-                "symbol": symbol,
-                "dates_requested": dates_to_fetch,
-                "failed_dates": failed_dates,
-            },
-        )
-
-    representative_exception = fetch_errors[0][1]
-    return create_error_response(
-        f"Failed to fetch option chain for '{symbol}' for all requested dates.",
-        error_code="API_ERROR",
-        details={
-            "symbol": symbol,
-            "dates_requested": dates_to_fetch,
-            "failed_dates": failed_dates,
-            "exception": str(representative_exception),
-        },
-    )
 
 
 @mcp.tool(
@@ -343,6 +168,71 @@ async def get_ticker_info(
                 logger.error("Unable to convert {}: {} to datetime: {}", key, value, exc)
 
     return dump_json(info)
+
+
+@mcp.tool(
+    name="yfinance_get_quote",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@_logged_tool
+async def get_quote(
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'NVDA', 'MSFT']. "
+                "Up to 100 tickers per call. Processed in batches of 10 with a 200 ms "
+                "delay between batches to avoid rate-limiting."
+            ),
+            min_length=1,
+            max_length=100,
+        ),
+    ],
+    fields: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Optional list of yfinance ticker.info field names to return. "
+                "When omitted, a curated ~35-field set is used (see tool description). "
+                "Example: ['currentPrice', 'trailingPE', 'targetMeanPrice', 'sector']"
+            ),
+        ),
+    ] = None,
+) -> str:
+    """Batch quote fetch for one or more tickers with an analysis-ready field set.
+
+    Returns a curated ~35-field subset of yfinance ticker.info per ticker (vs the full
+    ~127-field blob), keeping payloads small so parallel multi-ticker calls are reliable.
+    Pass the optional `fields` list to override the defaults.
+
+    Default fields:
+    - Price: currentPrice, regularMarketChange, regularMarketChangePercent,
+             regularMarketPreviousClose, regularMarketOpen,
+             regularMarketDayRange {low,high}, fiftyTwoWeekRange {low,high}
+    - Volume: regularMarketVolume, averageVolume, averageVolume10days
+    - Valuation: marketCap, trailingPE, forwardPE, trailingEps, forwardEps, pegRatio, priceToBook
+    - Dividends: dividendRate, dividendYield, exDividendDate
+    - Technicals: beta, fiftyDayAverage, twoHundredDayAverage
+    - Shares: sharesOutstanding
+    - Analyst: targetMeanPrice, recommendationKey, numberOfAnalystOpinions
+    - Earnings: earningsTimestamp
+    - Growth: revenueGrowth, earningsGrowth, profitMargins
+    - Identity: longName, sector, industry
+
+    Response shape (mirrors FinMCP get_quote):
+      {
+        "results": {
+          "AAPL": { "data": { ... }, "meta": { "dataAge": 0, "completenessScore": 0.97, "warnings": [] } }
+        },
+        "summary": { "totalRequested": 1, "totalReturned": 1, "errors": [] }
+      }
+    """
+    return dump_json(await QuoteFetcher.fetch_batch(symbols, fields))
 
 
 @mcp.tool(
@@ -781,113 +671,6 @@ async def get_top_companies(
     return dump_json(df.head(top_n).reset_index().to_dict(orient="records"))
 
 
-def _sector_key(name: str) -> str:
-    """Convert human-readable sector name to Yahoo Finance API key format."""
-    return name.lower().replace(" ", "-")
-
-
-def _industry_key(name: str) -> str:
-    """Convert human-readable industry name to Yahoo Finance API key format.
-
-    SECTOR_INDUSTY_MAPPING uses em dashes (—) and title case,
-    but the API expects lowercase with regular hyphens.
-    """
-    return name.lower().replace("& ", "").replace("- ", "").replace(", ", " ").replace("—", "-").replace(" ", "-")
-
-
-_INDUSTRY_FETCH_CONCURRENCY = asyncio.Semaphore(4)
-_INDUSTRY_FETCH_TIMEOUT_SECONDS = 5.0
-
-# Dedicated pool so slow/throttled Yahoo calls for industry data can't starve the shared
-# default executor that every other tool (ticker info, news, financials, etc.) also uses
-# via asyncio.to_thread. A stalled call here only ever blocks within this pool.
-_INDUSTRY_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="yf-industry")
-
-
-async def _run_in_industry_executor(func, *args):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_INDUSTRY_EXECUTOR, func, *args)
-
-
-async def _fetch_industry_table_once(industry_name: str, attr: str, expected_sector_key: str) -> Any:
-    industry = await _run_in_industry_executor(yf.Industry, _industry_key(industry_name))
-    table = await _run_in_industry_executor(lambda: getattr(industry, attr))
-    sector_key = await _run_in_industry_executor(lambda: industry.sector_key)
-    if sector_key != expected_sector_key:
-        logger.warning(
-            "Industry '{}' returned sector_key '{}', expected '{}'; skipping.",
-            industry_name,
-            sector_key,
-            expected_sector_key,
-        )
-        return None
-    return table
-
-
-async def _fetch_industry_table(industry_name: str, attr: str, expected_sector_key: str) -> Any:
-    """Fetch a per-industry table with one retry, since sectors with many industries
-
-    (e.g. Industrials has 25) fan out into many Yahoo calls, and a single slow/rate-limited
-    call used to stall the whole tool past the MCP client's timeout. Concurrency is capped
-    via a semaphore rather than firing all requests at once, to avoid bursting Yahoo's
-    unofficial, undocumented endpoint and risking IP throttling/blocking.
-
-    yfinance's default per-request HTTP timeout is 30s, which is too generous for an
-    interactive tool call: a handful of slow/throttled industries can exhaust the MCP
-    client's overall timeout even with capped concurrency. Each attempt is bounded to
-    _INDUSTRY_FETCH_TIMEOUT_SECONDS so a stalled call fails fast and frees its slot
-    instead of consuming a full 30s.
-
-    Also verifies the fetched industry actually belongs to the requested sector before
-    returning its table, as a guard against returning data for the wrong sector.
-    """
-    async with _INDUSTRY_FETCH_CONCURRENCY:
-        for attempt in range(2):
-            try:
-                return await asyncio.wait_for(
-                    _fetch_industry_table_once(industry_name, attr, expected_sector_key),
-                    timeout=_INDUSTRY_FETCH_TIMEOUT_SECONDS,
-                )
-            except (TimeoutError, *_RETRYABLE_YFINANCE_EXCEPTIONS) as exc:
-                if attempt == 0:
-                    await asyncio.sleep(0.5)
-                    continue
-                logger.warning("Failed to load industry {} after retry: {}", industry_name, exc)
-                return None
-            except Exception as exc:
-                logger.warning("Failed to load industry {}: {}", industry_name, exc)
-                return None
-        return None
-
-
-_INDUSTRY_FAN_OUT_DEADLINE_SECONDS = 60.0
-
-
-async def _gather_industry_tables(industries: list[str], attr: str, expected_sector_key: str) -> list[Any]:
-    """Run per-industry fetches with a hard wall-clock deadline for the whole fan-out.
-
-    Per-attempt timeouts in _fetch_industry_table only bound a single fetch once it starts
-    running; if multiple get_top calls land concurrently (e.g. overlapping users/tests) and
-    queue behind each other in the shared dedicated executor, the *aggregate* wait can still
-    stretch out far longer, as seen in production (89s/164s/295s for single tool calls). This
-    caps the entire fan-out so the tool call returns whatever finished in time instead of
-    hanging until an external timeout (MCP client, platform edge proxy) kills it.
-    """
-    if not industries:
-        return []
-
-    tasks = [
-        asyncio.ensure_future(_fetch_industry_table(industry_name, attr, expected_sector_key))
-        for industry_name in industries
-    ]
-    done, pending = await asyncio.wait(tasks, timeout=_INDUSTRY_FAN_OUT_DEADLINE_SECONDS)
-    for task in pending:
-        task.cancel()
-    if pending:
-        logger.warning("Industry fan-out deadline hit; {} of {} industries unfinished.", len(pending), len(tasks))
-    return [task.result() if task in done and not task.cancelled() else None for task in tasks]
-
-
 async def get_top_growth_companies(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top growth companies per industry", ge=1)],
@@ -1318,31 +1101,6 @@ def _build_financials_response(income_stmt, balance_sheet, cash_flow=None) -> di
             result["cash_flow"][field] = {str(col.date()): cash_flow.loc[field, col] for col in cash_flow.columns}
 
     return result
-
-
-async def _fetch_option_chain_for_date(
-    ticker: yf.Ticker,
-    date: str,
-    option_type: OptionChainType,
-) -> dict[str, Any]:
-    """Fetch option chain for a single expiration date."""
-    opt = await _run_yf(lambda d=date: ticker.option_chain(d))
-
-    calls_df = opt.calls
-    puts_df = opt.puts
-    date_data: dict[str, Any] = {}
-
-    if calls_df is not None and not calls_df.empty and option_type in {"all", "calls"}:
-        calls_df = calls_df.copy()
-        calls_df["optionType"] = "CALL"
-        date_data["calls"] = calls_df.to_dict(orient="records")
-
-    if puts_df is not None and not puts_df.empty and option_type in {"all", "puts"}:
-        puts_df = puts_df.copy()
-        puts_df["optionType"] = "PUT"
-        date_data["puts"] = puts_df.to_dict(orient="records")
-
-    return {date: date_data} if date_data else {}
 
 
 @mcp.tool(
