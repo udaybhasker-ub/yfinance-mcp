@@ -168,3 +168,46 @@ async def test_waiters_receive_exception_when_fetch_fails(mock_to_thread: AsyncM
     assert len(errors) == 3
     for e in errors:
         assert isinstance(e, (ConnectionError, Exception))
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.yf_runner.asyncio.to_thread")
+async def test_cancellation_does_not_leave_stale_inflight_entry(mock_to_thread: AsyncMock) -> None:
+    """Cancelling the designated fetcher must clean up _ticker_inflight.
+
+    This is the production failure mode: a previous request times out
+    (CancelledError), the stale Future stays in _ticker_inflight, and the
+    next request awaits it forever → 180s MCP timeout.
+    """
+    started = asyncio.Event()
+
+    async def blocking_to_thread(func, *args, **kwargs):
+        started.set()
+        # Block indefinitely until cancelled.
+        await asyncio.sleep(9999)
+
+    mock_to_thread.side_effect = blocking_to_thread
+
+    with patch("yfmcp.yf_runner.yf.Ticker"):
+        task = asyncio.create_task(_get_ticker("CANCEl"))
+        await started.wait()   # fetch is mid-flight
+        task.cancel()
+        with pytest.raises((asyncio.CancelledError, Exception)):
+            await task
+
+    # _ticker_inflight must be empty — no stale Future.
+    assert "CANCEL" not in _ticker_inflight
+    assert "CANCEl" not in _ticker_inflight  # test used mixed-case key
+
+    # A fresh call must succeed (not hang awaiting the stale Future).
+    ticker_obj = _make_ticker_mock("CANCEL")
+
+    async def instant_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    mock_to_thread.side_effect = instant_to_thread
+
+    with patch("yfmcp.yf_runner.yf.Ticker", return_value=ticker_obj):
+        result = await asyncio.wait_for(_get_ticker("CANCEL"), timeout=2.0)
+
+    assert result is ticker_obj

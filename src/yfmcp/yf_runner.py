@@ -55,6 +55,13 @@ _ticker_inflight_lock = asyncio.Lock()
 
 def _describe_yf_call(func, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     name = getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or repr(func)
+    # For bound methods on a yf.Ticker instance, prepend the symbol so logs
+    # show e.g. "[SNDK] TickerBase.get_analyst_price_targets" instead of just
+    # the class+method name with no context about which ticker was queried.
+    self_obj = getattr(func, "__self__", None)
+    ticker_sym = getattr(self_obj, "ticker", None)
+    if ticker_sym:
+        name = f"[{ticker_sym}] {name}"
     parts = [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
     return f"{name}({', '.join(parts)})" if parts else name
 
@@ -135,13 +142,28 @@ async def _get_ticker(symbol: str) -> Any:
         await _ticker_cache.set(key, {}, ticker)
         fut.set_result(ticker)
         return ticker
-    except Exception as exc:
+    except BaseException as exc:
+        # Must catch BaseException (not just Exception) so that CancelledError
+        # is handled here too.  If we only caught Exception, a cancellation
+        # would skip this block, leave fut unresolved, and any coroutine
+        # awaiting it would hang forever until the next MCP timeout.
         if not fut.done():
-            fut.set_exception(exc)
+            if isinstance(exc, Exception):
+                # Regular error — propagate it to waiters.
+                fut.set_exception(exc)
+            else:
+                # CancelledError (BaseException) — cancel the Future so that
+                # waiters receive CancelledError rather than hanging.
+                fut.cancel()
         raise
     finally:
-        async with _ticker_inflight_lock:
-            _ticker_inflight.pop(key, None)
+        # Plain dict pop — NO async lock here.  Using `async with lock` in a
+        # finally block is dangerous: if the task is cancelled again while
+        # awaiting the lock, the pop never runs and the stale Future stays in
+        # _ticker_inflight, causing the next caller to await it forever.
+        # A synchronous dict.pop() has no await point so it cannot be
+        # interrupted by another CancelledError.
+        _ticker_inflight.pop(key, None)
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
