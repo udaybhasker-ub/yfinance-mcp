@@ -113,6 +113,13 @@ class SharedSecretOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCo
         return self._issue_tokens(client.client_id, scopes)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
+        # Allow the raw shared secret itself as a long-lived bearer token, for
+        # server-to-server callers (e.g. the orchestrator) that can't run the
+        # interactive OAuth login form. The OAuth flow above remains the path
+        # for connectors like claude.ai.
+        if token == self._secret:
+            return AccessToken(token=token, client_id="shared-secret", scopes=[], expires_at=None)
+
         access_token = self._access_tokens.get(token)
         if access_token is None:
             return None
