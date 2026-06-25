@@ -24,6 +24,9 @@ from yfmcp.financials_fetcher import processor as financials_processor
 from yfmcp.industry import SECTOR_INDUSTY_MAPPING
 from yfmcp.industry import _gather_industry_tables
 from yfmcp.industry import _sector_key
+from yfmcp.jq_filter import TEMPLATE_FIELD_DESCRIPTION
+from yfmcp.jq_filter import TEMPLATE_FILE_FIELD_DESCRIPTION
+from yfmcp.jq_filter import jq_or_json
 from yfmcp.logging import _logged_tool
 from yfmcp.news_fetcher import processor as news_processor
 from yfmcp.options import _create_option_chain_fetch_error
@@ -43,7 +46,6 @@ from yfmcp.types import SearchType
 from yfmcp.types import Sector
 from yfmcp.types import TopType
 from yfmcp.utils import create_error_response
-from yfmcp.utils import dump_json
 from yfmcp.yf_runner import _RETRYABLE_YFINANCE_EXCEPTIONS
 from yfmcp.yf_runner import _create_retryable_error_response
 from yfmcp.yf_runner import _get_ticker
@@ -53,6 +55,14 @@ from yfmcp.yf_runner import _select_retryable_exception
 
 _EQUITY_FILTER_OVERFETCH_FACTOR = 4
 _YAHOO_SCREENER_MAX_SIZE = 250
+
+# ---------------------------------------------------------------------------
+# Reusable Annotated type aliases for jq template parameters.
+# Added to every JSON-returning tool so callers can reshape responses without
+# a separate post-processing step.
+# ---------------------------------------------------------------------------
+_JqTemplate = Annotated[str | None, Field(description=TEMPLATE_FIELD_DESCRIPTION)]
+_JqTemplateFile = Annotated[str | None, Field(description=TEMPLATE_FILE_FIELD_DESCRIPTION)]
 
 _base_url = os.environ.get("MCP_PUBLIC_URL") or f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')}"
 
@@ -124,6 +134,8 @@ async def favicon_png(request: Any) -> Any:
 @_logged_tool
 async def get_ticker_info(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Retrieve comprehensive stock data including company information, financials, trading metrics and governance.
 
@@ -173,7 +185,7 @@ async def get_ticker_info(
             except Exception as exc:
                 logger.error("Unable to convert {}: {} to datetime: {}", key, value, exc)
 
-    return dump_json(info)
+    return jq_or_json(info, template, template_file)
 
 
 @mcp.tool(
@@ -213,6 +225,8 @@ async def get_quote(
         bool,
         Field(description="Bypass the 1-minute cache and fetch fresh data. The result is written back to cache."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Batch quote fetch for one or more tickers with an analysis-ready field set.
 
@@ -242,7 +256,7 @@ async def get_quote(
         "summary": { "totalRequested": 1, "totalReturned": 1, "errors": [] }
       }
     """
-    return dump_json(await QuoteFetcher.fetch_batch(symbols, fields, no_cache=no_cache))
+    return jq_or_json(await QuoteFetcher.fetch_batch(symbols, fields, no_cache=no_cache), template, template_file)
 
 
 @mcp.tool(
@@ -271,6 +285,8 @@ async def get_ticker_news(
         bool,
         Field(description="Bypass the 2-minute cache and fetch fresh headlines. The result is written back to cache."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch recent news articles and press releases for one or more stocks.
 
@@ -297,7 +313,7 @@ async def get_ticker_news(
 
     Use this to track company announcements, market sentiment, and breaking news.
     """
-    return dump_json(await news_processor.run(symbols, no_cache=no_cache))
+    return jq_or_json(await news_processor.run(symbols, no_cache=no_cache), template, template_file)
 
 
 @mcp.tool(
@@ -318,6 +334,8 @@ async def search(
             description="Filter results: 'all' (quotes + news), 'quotes' (stocks/ETFs only), or 'news' (articles only)"
         ),
     ],
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Search Yahoo Finance for stocks, ETFs, and news articles.
 
@@ -358,11 +376,11 @@ async def search(
 
     match search_type.lower():
         case "all":
-            return dump_json(s.all)
+            return jq_or_json(s.all, template, template_file)
         case "quotes":
-            return dump_json(s.quotes)
+            return jq_or_json(s.quotes, template, template_file)
         case "news":
-            return dump_json(s.news)
+            return jq_or_json(s.news, template, template_file)
         case _:
             return create_error_response(
                 f"Invalid search_type '{search_type}'. Valid options: 'all', 'quotes', 'news'.",
@@ -408,6 +426,8 @@ async def screen(
     sort_asc: Annotated[bool | None, Field(description="Sort ascending if true, descending if false.")] = None,
     user_id: Annotated[str | None, Field(description="Optional Yahoo user id.")] = None,
     user_id_type: Annotated[str | None, Field(description="Optional Yahoo user id type, commonly 'guid'.")] = None,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Run a Yahoo Finance screener query.
 
@@ -493,7 +513,7 @@ async def screen(
         if size is not None:
             result = truncate_quotes(result, size)
 
-    return dump_json(result)
+    return jq_or_json(result, template, template_file)
 
 
 @mcp.tool(
@@ -539,6 +559,8 @@ async def screen_gappers(
         bool,
         Field(description="Sort by percentchange ascending if true, descending if false."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Run a custom equity screener tuned for opening-session stock gappers."""
     query = {
@@ -581,12 +603,14 @@ async def screen_gappers(
     result = filter_us_currency_quotes(result)
     result = truncate_quotes(result, size)
 
-    return dump_json(result)
+    return jq_or_json(result, template, template_file)
 
 
 async def get_top_etfs(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top ETFs to retrieve", ge=1)],
+    template: str | None = None,
+    template_file: str | None = None,
 ) -> str:
     """Get the most popular ETFs for a specific sector.
 
@@ -614,12 +638,14 @@ async def get_top_etfs(
         )
 
     result = [{"symbol": symbol, "name": name} for symbol, name in list(etfs.items())[:top_n]]
-    return dump_json(result)
+    return jq_or_json(result, template, template_file)
 
 
 async def get_top_mutual_funds(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top mutual funds to retrieve", ge=1)],
+    template: str | None = None,
+    template_file: str | None = None,
 ) -> str:
     """Get the most popular mutual funds for a specific sector.
 
@@ -651,12 +677,14 @@ async def get_top_mutual_funds(
         )
 
     result = [{"symbol": symbol, "name": name} for symbol, name in list(funds.items())[:top_n]]
-    return dump_json(result)
+    return jq_or_json(result, template, template_file)
 
 
 async def get_top_companies(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top companies to retrieve", ge=1)],
+    template: str | None = None,
+    template_file: str | None = None,
 ) -> str:
     """Get top companies in a sector by market capitalization.
 
@@ -682,12 +710,14 @@ async def get_top_companies(
             details={"sector": sector},
         )
 
-    return dump_json(df.head(top_n).reset_index().to_dict(orient="records"))
+    return jq_or_json(df.head(top_n).reset_index().to_dict(orient="records"), template, template_file)
 
 
 async def get_top_growth_companies(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top growth companies per industry", ge=1)],
+    template: str | None = None,
+    template_file: str | None = None,
 ) -> str:
     """Get fastest-growing companies organized by industry within a sector.
 
@@ -728,12 +758,14 @@ async def get_top_growth_companies(
             details={"sector": sector},
         )
 
-    return dump_json(results)
+    return jq_or_json(results, template, template_file)
 
 
 async def get_top_performing_companies(
     sector: Annotated[Sector, Field(description="Market sector (e.g., 'Technology', 'Healthcare')")],
     top_n: Annotated[int, Field(description="Number of top performing companies per industry", ge=1)],
+    template: str | None = None,
+    template_file: str | None = None,
 ) -> str:
     """Get best-performing companies by stock price performance, organized by industry.
 
@@ -774,7 +806,7 @@ async def get_top_performing_companies(
             details={"sector": sector},
         )
 
-    return dump_json(results)
+    return jq_or_json(results, template, template_file)
 
 
 @mcp.tool(
@@ -812,6 +844,8 @@ async def get_top(
             le=100,
         ),
     ] = 10,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Get top-ranked financial entities within a sector.
 
@@ -825,15 +859,15 @@ async def get_top(
     """
     match top_type:
         case "top_etfs":
-            return await get_top_etfs(sector, top_n)
+            return await get_top_etfs(sector, top_n, template=template, template_file=template_file)
         case "top_mutual_funds":
-            return await get_top_mutual_funds(sector, top_n)
+            return await get_top_mutual_funds(sector, top_n, template=template, template_file=template_file)
         case "top_companies":
-            return await get_top_companies(sector, top_n)
+            return await get_top_companies(sector, top_n, template=template, template_file=template_file)
         case "top_growth_companies":
-            return await get_top_growth_companies(sector, top_n)
+            return await get_top_growth_companies(sector, top_n, template=template, template_file=template_file)
         case "top_performing_companies":
-            return await get_top_performing_companies(sector, top_n)
+            return await get_top_performing_companies(sector, top_n, template=template, template_file=template_file)
         case _:
             return create_error_response(
                 f"Invalid top_type '{top_type}'. "
@@ -915,6 +949,8 @@ async def get_price_history(
         bool,
         Field(description="Bypass the 15-minute cache and fetch fresh data. The result is written back to cache."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str | ImageContent:
     """Fetch historical price data for one or more tickers, with optional chart for single-ticker calls.
 
@@ -969,9 +1005,10 @@ async def get_price_history(
         return await asyncio.to_thread(generate_chart, symbol=symbol, df=df, chart_type=chart_type)
 
     # Batch path — tabular only.
-    return dump_json(
-        await price_history_processor.run(symbols, no_cache=no_cache, period=period, interval=interval, prepost=prepost)
+    data = await price_history_processor.run(
+        symbols, no_cache=no_cache, period=period, interval=interval, prepost=prepost
     )
+    return jq_or_json(data, template, template_file)
 
 
 @mcp.tool(
@@ -1009,6 +1046,8 @@ async def get_financials(
         bool,
         Field(description="Bypass the 6-hour cache and fetch fresh statements. The result is written back to cache."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch financial statements for one or more tickers (income statement, balance sheet, cash flow).
 
@@ -1031,7 +1070,9 @@ async def get_financials(
     Use the data to analyze trends, calculate ratios, or compare companies across periods.
     Financials update once per quarter; responses are cached for 6 hours.
     """
-    return dump_json(await financials_processor.run(symbols, no_cache=no_cache, frequency=frequency))
+    return jq_or_json(
+        await financials_processor.run(symbols, no_cache=no_cache, frequency=frequency), template, template_file
+    )
 
 
 @mcp.tool(
@@ -1060,6 +1101,8 @@ async def get_option_chain(
         OptionChainType,
         Field(description=("Which options to return: 'calls', 'puts', or 'all' (both calls and puts).")),
     ] = "all",
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch option chain data (calls and puts) for a stock with available strike prices.
 
@@ -1132,7 +1175,7 @@ async def get_option_chain(
         result.update(date_result)
 
     if result:
-        return dump_json(result)
+        return jq_or_json(result, template, template_file)
 
     if fetch_errors:
         return _create_option_chain_fetch_error(symbol, dates_to_fetch, fetch_errors)
@@ -1156,6 +1199,8 @@ async def get_option_chain(
 @_logged_tool
 async def get_option_dates(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch available option expiration dates for a stock.
 
@@ -1182,7 +1227,7 @@ async def get_option_dates(
             details={"symbol": symbol},
         )
 
-    return dump_json(dates)
+    return jq_or_json(dates, template, template_file)
 
 
 async def _fetch_holder_section(
@@ -1233,6 +1278,8 @@ async def get_holders(
         int,
         Field(description="Maximum rows returned per holder section. Use 0 to return all rows."),
     ] = 10,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch major holders, institutional holders, mutual fund holders, and insider data.
 
@@ -1333,7 +1380,7 @@ async def get_holders(
         )
 
     result["_metadata"] = {"max_rows": max_rows, "sections": section_metadata}
-    return dump_json(result)
+    return jq_or_json(result, template, template_file)
 
 
 def main() -> None:
@@ -1393,6 +1440,8 @@ async def get_earnings(
         bool,
         Field(description="Bypass the 1-hour cache and fetch fresh estimates. The result is written back to cache."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch earnings beat/miss history, forward EPS/revenue estimates, and revision trends for one or more tickers.
 
@@ -1416,7 +1465,9 @@ async def get_earnings(
 
     Useful for pre-earnings sweeps across a watchlist. Results cached for 1 hour.
     """
-    return dump_json(await earnings_processor.run(symbols, no_cache=no_cache, history_limit=history_limit))
+    return jq_or_json(
+        await earnings_processor.run(symbols, no_cache=no_cache, history_limit=history_limit), template, template_file
+    )
 
 
 @mcp.tool(
@@ -1449,6 +1500,8 @@ async def get_analyst(
         bool,
         Field(description="Bypass the 1-hour cache and fetch fresh analyst data. The result is written back to cache."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch analyst consensus, price targets, and upgrade/downgrade history for one or more tickers.
 
@@ -1470,7 +1523,9 @@ async def get_analyst(
 
     Useful for watchlist-wide consensus sweeps. Results cached for 1 hour.
     """
-    return dump_json(await analyst_processor.run(symbols, no_cache=no_cache, upgrades_limit=upgrades_limit))
+    return jq_or_json(
+        await analyst_processor.run(symbols, no_cache=no_cache, upgrades_limit=upgrades_limit), template, template_file
+    )
 
 
 @mcp.tool(
@@ -1520,6 +1575,8 @@ async def get_combined_quote(
         bool,
         Field(description="Bypass all caches and fetch fresh data. Results are written back to cache."),
     ] = False,
+    template: _JqTemplate = None,
+    template_file: _JqTemplateFile = None,
 ) -> str:
     """Fetch quote + analyst + earnings for one or more tickers in a single call.
 
@@ -1587,4 +1644,4 @@ async def get_combined_quote(
 
     merged["summary"]["totalReturned"] = len(merged["results"])
 
-    return dump_json(merged)
+    return jq_or_json(merged, template, template_file)
