@@ -1,6 +1,7 @@
 """Tests for REST endpoints layered on top of MCP tools."""
 
 import base64
+import math
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 
@@ -169,3 +170,29 @@ async def test_quote_route_accepts_shared_secret_bearer_token(
     assert response.status_code == 200
     assert response.json()["results"]["AAPL"]["data"]["currentPrice"] == 123.45
     mock_get_quote.assert_awaited_once_with(["AAPL"], fields=None, no_cache=False)
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server._auth_provider", new=SharedSecretOAuthProvider("rest-secret"))
+@patch("yfmcp.server.get_earnings", new_callable=AsyncMock)
+async def test_earnings_route_preserves_nan_json_values(
+    mock_get_earnings: AsyncMock, rest_client: httpx.AsyncClient
+) -> None:
+    mock_get_earnings.return_value = (
+        '{"results":{"AAPL":{"data":{"earnings_dates":{"2026-07-30 16:00 EDT":'
+        '{"EPS Estimate":1.89,"Reported EPS":NaN,"Surprise(%)":NaN}}},'
+        '"meta":{}}},'
+        '"summary":{"totalRequested":1,"totalReturned":1,"errors":[]}}'
+    )
+
+    response = await rest_client.get(
+        "/earnings",
+        params={"symbols": "AAPL"},
+        headers={"Authorization": "Bearer rest-secret"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    earnings_row = payload["results"]["AAPL"]["data"]["earnings_dates"]["2026-07-30 16:00 EDT"]
+    assert math.isnan(earnings_row["Reported EPS"])
+    assert math.isnan(earnings_row["Surprise(%)"])

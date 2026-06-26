@@ -161,23 +161,22 @@ def _get_query_bool(request: Any, name: str, default: bool = False) -> bool:
     raise ValueError(f"Invalid boolean value for '{name}': {raw}")
 
 
-def _parse_json_tool_result(result: str) -> tuple[dict[str, Any] | list[Any], int]:
+def _parse_json_tool_result(result: str) -> tuple[int, str]:
     payload = json.loads(result)
     status_code = 200
     if isinstance(payload, dict) and "error_code" in payload:
         status_code = _ERROR_HTTP_STATUS.get(str(payload["error_code"]), 500)
-    return payload, status_code
+    return status_code, result
 
 
 async def _rest_response(result: str | ImageContent) -> Any:
-    from starlette.responses import JSONResponse
     from starlette.responses import Response
 
     if isinstance(result, ImageContent):
         return Response(content=base64.b64decode(result.data), media_type=result.mimeType)
 
-    payload, status_code = _parse_json_tool_result(result)
-    return JSONResponse(payload, status_code=status_code)
+    status_code, body = _parse_json_tool_result(result)
+    return Response(content=body, status_code=status_code, media_type="application/json")
 
 
 def _invalid_query_param_response(name: str, value: str, expected: str) -> str:
