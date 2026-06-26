@@ -1,18 +1,13 @@
 """jq template filtering layer for MCP tool responses.
 
-Callers can supply either an inline jq expression (``template``) or a path to a
-``.jq`` file (``template_file``).  When both are provided, ``template_file``
-takes precedence.  All paths are resolved relative to the current working
-directory.
-
-If neither argument is provided the helpers behave as no-ops and the caller
-should fall back to serialising raw JSON with :func:`~yfmcp.utils.dump_json`.
+Callers can supply an inline jq expression via ``template``.
+If no template is provided the helpers behave as no-ops and the caller should
+fall back to serialising raw JSON with :func:`~yfmcp.utils.dump_json`.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from yfmcp.utils import create_error_response
 from yfmcp.utils import dump_json
@@ -32,14 +27,6 @@ except ImportError:  # pragma: no cover
 TEMPLATE_FIELD_DESCRIPTION: str = (
     "Optional jq expression to transform the JSON response "
     "(e.g. '.results[] | .symbol'). "
-    "Ignored when the tool returns an image. "
-    "If template_file is also provided, template_file takes precedence."
-)
-
-TEMPLATE_FILE_FIELD_DESCRIPTION: str = (
-    "Path to a .jq file whose contents are used as the jq expression. "
-    "The path is resolved relative to the current working directory. "
-    "Takes precedence over template when both are provided. "
     "Ignored when the tool returns an image."
 )
 
@@ -52,14 +39,13 @@ TEMPLATE_FILE_FIELD_DESCRIPTION: str = (
 def apply_jq_template(
     data: object,
     template: str | None = None,
-    template_file: str | None = None,
 ) -> str | None:
     """Apply a jq expression to *data* and return the rendered text.
 
     Returns
     -------
     ``None``
-        Neither *template* nor *template_file* was provided — the caller
+        *template* was not provided — the caller
         should serialise *data* as plain JSON.
     str
         The jq output text (may be multi-line for multi-valued expressions).
@@ -67,7 +53,7 @@ def apply_jq_template(
         returned string is a structured error JSON matching the project's
         ``create_error_response`` format.
     """
-    if not template and not template_file:
+    if not template:
         return None
 
     if not _JQ_AVAILABLE:  # pragma: no cover
@@ -76,27 +62,7 @@ def apply_jq_template(
             error_code="DEPENDENCY_ERROR",
         )
 
-    # Resolve expression — template_file wins when both args are given.
-    expr: str
-    if template_file:
-        path = Path(template_file)
-        try:
-            expr = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return create_error_response(
-                f"Template file not found: '{template_file}'. "
-                "The path is resolved relative to the server's working directory.",
-                error_code="TEMPLATE_FILE_NOT_FOUND",
-                details={"template_file": template_file},
-            )
-        except OSError as exc:
-            return create_error_response(
-                f"Cannot read template file '{template_file}': {exc}",
-                error_code="TEMPLATE_FILE_ERROR",
-                details={"template_file": template_file, "exception": str(exc)},
-            )
-    else:
-        expr = template  # type: ignore[assignment]  # truthy-checked above
+    expr = template
 
     # Compile the jq program.
     try:
@@ -131,7 +97,6 @@ def apply_jq_template(
 def jq_or_json(
     data: object,
     template: str | None,
-    template_file: str | None,
 ) -> str:
     """Serialise *data*, optionally through a jq template.
 
@@ -139,16 +104,14 @@ def jq_or_json(
 
     .. code-block:: python
 
-        return jq_or_json(result, template, template_file)
+        return jq_or_json(result, template)
 
     When no template arguments are provided it behaves identically to
     ``dump_json(data)``.  On template errors it returns the structured error
     JSON produced by :func:`apply_jq_template`.
     """
-    if not template and not template_file:
+    if not template:
         return dump_json(data)
-    # apply_jq_template only returns None when both args are falsy — already
-    # handled above — so the cast is safe.
-    result = apply_jq_template(data, template=template, template_file=template_file)
+    result = apply_jq_template(data, template=template)
     assert result is not None, "apply_jq_template must not return None here"  # noqa: S101
     return result
