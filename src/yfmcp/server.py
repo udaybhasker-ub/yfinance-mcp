@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import json
 import os
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Annotated
 from typing import Any
@@ -106,6 +109,14 @@ async def health_check(request: Any) -> Any:
 
 
 _ASSETS_DIR = Path(__file__).parent / "assets"
+_ERROR_HTTP_STATUS = {
+    "INVALID_PARAMS": 400,
+    "INVALID_SYMBOL": 404,
+    "NO_DATA": 404,
+    "NETWORK_ERROR": 503,
+    "API_ERROR": 502,
+    "UNKNOWN_ERROR": 500,
+}
 
 
 @mcp.custom_route("/favicon.ico", methods=["GET"], name="favicon_ico", include_in_schema=False)
@@ -120,6 +131,466 @@ async def favicon_png(request: Any) -> Any:
     from starlette.responses import FileResponse
 
     return FileResponse(_ASSETS_DIR / "favicon.png", media_type="image/png")
+
+
+def _parse_csv_query_values(values: list[str]) -> list[str]:
+    items: list[str] = []
+    for value in values:
+        for part in value.split(","):
+            item = part.strip()
+            if item:
+                items.append(item)
+    return items
+
+
+def _get_query_list(request: Any, name: str) -> list[str]:
+    return _parse_csv_query_values(request.query_params.getlist(name))
+
+
+def _get_query_bool(request: Any, name: str, default: bool = False) -> bool:
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(f"Invalid boolean value for '{name}': {raw}")
+
+
+def _parse_json_tool_result(result: str) -> tuple[dict[str, Any] | list[Any], int]:
+    payload = json.loads(result)
+    status_code = 200
+    if isinstance(payload, dict) and "error_code" in payload:
+        status_code = _ERROR_HTTP_STATUS.get(str(payload["error_code"]), 500)
+    return payload, status_code
+
+
+async def _rest_response(result: str | ImageContent) -> Any:
+    from starlette.responses import JSONResponse
+    from starlette.responses import Response
+
+    if isinstance(result, ImageContent):
+        return Response(content=base64.b64decode(result.data), media_type=result.mimeType)
+
+    payload, status_code = _parse_json_tool_result(result)
+    return JSONResponse(payload, status_code=status_code)
+
+
+def _invalid_query_param_response(name: str, value: str, expected: str) -> str:
+    return create_error_response(
+        f"Invalid query parameter '{name}' with value '{value}'. Expected {expected}.",
+        error_code="INVALID_PARAMS",
+        details={"parameter": name, "value": value, "expected": expected},
+    )
+
+
+async def _unauthorized_rest_response() -> Any:
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(
+        {"error": "invalid_token", "error_description": "Authentication required"},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Bearer error="invalid_token", error_description="Authentication required"'},
+    )
+
+
+async def _authorize_rest_request(request: Any) -> Any | None:
+    if _auth_provider is None:
+        return None
+
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return await _unauthorized_rest_response()
+
+    token = auth_header[7:].strip()
+    access_token = await _auth_provider.load_access_token(token)
+    if access_token is None:
+        return await _unauthorized_rest_response()
+
+    return None
+
+
+def _protected_custom_route(path: str, methods: list[str], name: str):
+    def decorator(func):
+        @wraps(func)
+        async def wrapped(request: Any) -> Any:
+            auth_error = await _authorize_rest_request(request)
+            if auth_error is not None:
+                return auth_error
+            return await func(request)
+
+        return mcp.custom_route(path, methods=methods, name=name, include_in_schema=False)(wrapped)
+
+    return decorator
+
+
+@_protected_custom_route("/ticker/{symbol}", methods=["GET"], name="rest_ticker_info")
+async def rest_get_ticker_info(request: Any) -> Any:
+    return await _rest_response(await get_ticker_info(request.path_params["symbol"]))
+
+
+@_protected_custom_route("/quote", methods=["GET"], name="rest_quote")
+async def rest_get_quote(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    fields = _get_query_list(request, "fields") or None
+    no_cache = _get_query_bool(request, "no_cache", False)
+
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    return await _rest_response(await get_quote(symbols, fields=fields, no_cache=no_cache))
+
+
+@_protected_custom_route("/quote/{symbol}", methods=["GET"], name="rest_quote_single")
+async def rest_get_quote_single(request: Any) -> Any:
+    fields = _get_query_list(request, "fields") or None
+    no_cache = _get_query_bool(request, "no_cache", False)
+    return await _rest_response(await get_quote([request.path_params["symbol"]], fields=fields, no_cache=no_cache))
+
+
+@_protected_custom_route("/news", methods=["GET"], name="rest_news")
+async def rest_get_news(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    no_cache = _get_query_bool(request, "no_cache", False)
+
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    return await _rest_response(await get_ticker_news(symbols, no_cache=no_cache))
+
+
+@_protected_custom_route("/news/{symbol}", methods=["GET"], name="rest_news_single")
+async def rest_get_news_single(request: Any) -> Any:
+    no_cache = _get_query_bool(request, "no_cache", False)
+    return await _rest_response(await get_ticker_news([request.path_params["symbol"]], no_cache=no_cache))
+
+
+@_protected_custom_route("/search", methods=["GET"], name="rest_search")
+async def rest_search(request: Any) -> Any:
+    query = request.query_params.get("q")
+    search_type = request.query_params.get("type", "all")
+
+    if not query:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'q' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "q"},
+            )
+        )
+
+    return await _rest_response(await search(query=query, search_type=search_type))
+
+
+@_protected_custom_route("/screen", methods=["GET", "POST"], name="rest_screen")
+async def rest_screen(request: Any) -> Any:
+    if request.method == "GET":
+        query = request.query_params.get("query")
+        if not query:
+            return await _rest_response(
+                create_error_response(
+                    "Query parameter 'query' is required for GET /screen.",
+                    error_code="INVALID_PARAMS",
+                    details={"parameter": "query", "method": "GET"},
+                )
+            )
+
+        query_type = request.query_params.get("query_type", "predefined")
+        offset_raw = request.query_params.get("offset")
+        size_raw = request.query_params.get("size")
+        count_raw = request.query_params.get("count")
+        sort_field = request.query_params.get("sort_field")
+        sort_asc_raw = request.query_params.get("sort_asc")
+        user_id = request.query_params.get("user_id")
+        user_id_type = request.query_params.get("user_id_type")
+
+        try:
+            offset = int(offset_raw) if offset_raw is not None else None
+            size = int(size_raw) if size_raw is not None else None
+            count = int(count_raw) if count_raw is not None else None
+            sort_asc = None if sort_asc_raw is None else _get_query_bool(request, "sort_asc")
+        except ValueError as exc:
+            return await _rest_response(
+                create_error_response(
+                    str(exc),
+                    error_code="INVALID_PARAMS",
+                    details={"method": "GET"},
+                )
+            )
+
+        return await _rest_response(
+            await screen(
+                query=query,
+                query_type=query_type,
+                offset=offset,
+                size=size,
+                count=count,
+                sort_field=sort_field,
+                sort_asc=sort_asc,
+                user_id=user_id,
+                user_id_type=user_id_type,
+            )
+        )
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return await _rest_response(
+            create_error_response(
+                "Request body must be valid JSON.",
+                error_code="INVALID_PARAMS",
+                details={"method": "POST"},
+            )
+        )
+
+    return await _rest_response(
+        await screen(
+            query=payload.get("query"),
+            query_type=payload.get("query_type", "predefined"),
+            offset=payload.get("offset"),
+            size=payload.get("size"),
+            count=payload.get("count"),
+            sort_field=payload.get("sort_field"),
+            sort_asc=payload.get("sort_asc"),
+            user_id=payload.get("user_id"),
+            user_id_type=payload.get("user_id_type"),
+        )
+    )
+
+
+@_protected_custom_route("/screen/gappers", methods=["GET"], name="rest_screen_gappers")
+async def rest_screen_gappers(request: Any) -> Any:
+    try:
+        min_percent_change = float(request.query_params.get("min_percent_change", "3.0"))
+        min_price = float(request.query_params.get("min_price", "5.0"))
+        min_volume = int(request.query_params.get("min_volume", "500000"))
+        min_market_cap = int(request.query_params.get("min_market_cap", "2000000000"))
+        region = request.query_params.get("region", "us")
+        size = int(request.query_params.get("size", "50"))
+        offset = int(request.query_params.get("offset", "0"))
+        sort_asc = _get_query_bool(request, "sort_asc", False)
+    except ValueError as exc:
+        return await _rest_response(create_error_response(str(exc), error_code="INVALID_PARAMS"))
+
+    return await _rest_response(
+        await screen_gappers(
+            min_percent_change=min_percent_change,
+            min_price=min_price,
+            min_volume=min_volume,
+            min_market_cap=min_market_cap,
+            region=region,
+            size=size,
+            offset=offset,
+            sort_asc=sort_asc,
+        )
+    )
+
+
+@_protected_custom_route("/top/{sector}", methods=["GET"], name="rest_top")
+async def rest_get_top(request: Any) -> Any:
+    top_type = request.query_params.get("type")
+    if not top_type:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'type' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "type"},
+            )
+        )
+
+    top_n_raw = request.query_params.get("n", "10")
+    try:
+        top_n = int(top_n_raw)
+    except ValueError:
+        return await _rest_response(_invalid_query_param_response("n", top_n_raw, "an integer"))
+
+    return await _rest_response(await get_top(sector=request.path_params["sector"], top_type=top_type, top_n=top_n))
+
+
+@_protected_custom_route("/price-history", methods=["GET"], name="rest_price_history")
+async def rest_get_price_history(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    period = request.query_params.get("period", "1mo")
+    interval = request.query_params.get("interval", "1d")
+    chart_type = request.query_params.get("chart_type")
+    prepost = _get_query_bool(request, "prepost", False)
+    no_cache = _get_query_bool(request, "no_cache", False)
+
+    return await _rest_response(
+        await get_price_history(
+            symbols=symbols,
+            period=period,
+            interval=interval,
+            chart_type=chart_type,
+            prepost=prepost,
+            no_cache=no_cache,
+        )
+    )
+
+
+@_protected_custom_route("/financials", methods=["GET"], name="rest_financials")
+async def rest_get_financials(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    no_cache = _get_query_bool(request, "no_cache", False)
+    frequency = request.query_params.get("frequency", "annual")
+
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    return await _rest_response(await get_financials(symbols=symbols, frequency=frequency, no_cache=no_cache))
+
+
+@_protected_custom_route("/options/{symbol}", methods=["GET"], name="rest_option_chain")
+async def rest_get_option_chain(request: Any) -> Any:
+    expiration_date = request.query_params.get("expiration_date")
+    option_type = request.query_params.get("option_type", "all")
+    return await _rest_response(
+        await get_option_chain(
+            symbol=request.path_params["symbol"],
+            expiration_date=expiration_date,
+            option_type=option_type,
+        )
+    )
+
+
+@_protected_custom_route("/options/{symbol}/dates", methods=["GET"], name="rest_option_dates")
+async def rest_get_option_dates(request: Any) -> Any:
+    return await _rest_response(await get_option_dates(request.path_params["symbol"]))
+
+
+@_protected_custom_route("/holders/{symbol}", methods=["GET"], name="rest_holders")
+async def rest_get_holders(request: Any) -> Any:
+    max_rows_raw = request.query_params.get("max_rows", "10")
+    try:
+        max_rows = int(max_rows_raw)
+    except ValueError:
+        return await _rest_response(_invalid_query_param_response("max_rows", max_rows_raw, "an integer"))
+
+    return await _rest_response(await get_holders(symbol=request.path_params["symbol"], max_rows=max_rows))
+
+
+@_protected_custom_route("/earnings", methods=["GET"], name="rest_earnings")
+async def rest_get_earnings(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    no_cache = _get_query_bool(request, "no_cache", False)
+    history_limit_raw = request.query_params.get("history_limit", "12")
+
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    try:
+        history_limit = int(history_limit_raw)
+    except ValueError:
+        return await _rest_response(_invalid_query_param_response("history_limit", history_limit_raw, "an integer"))
+
+    return await _rest_response(
+        await get_earnings(symbols=symbols, history_limit=history_limit, no_cache=no_cache)
+    )
+
+
+@_protected_custom_route("/analyst", methods=["GET"], name="rest_analyst")
+async def rest_get_analyst(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    no_cache = _get_query_bool(request, "no_cache", False)
+    upgrades_limit_raw = request.query_params.get("upgrades_limit", "20")
+
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    try:
+        upgrades_limit = int(upgrades_limit_raw)
+    except ValueError:
+        return await _rest_response(_invalid_query_param_response("upgrades_limit", upgrades_limit_raw, "an integer"))
+
+    return await _rest_response(
+        await get_analyst(symbols=symbols, upgrades_limit=upgrades_limit, no_cache=no_cache)
+    )
+
+
+@_protected_custom_route("/combined-quote", methods=["GET"], name="rest_combined_quote")
+async def rest_get_combined_quote(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    quote_fields = _get_query_list(request, "quote_fields") or None
+    no_cache = _get_query_bool(request, "no_cache", False)
+    history_limit_raw = request.query_params.get("history_limit", "8")
+    upgrades_limit_raw = request.query_params.get("upgrades_limit", "10")
+
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    try:
+        history_limit = int(history_limit_raw)
+        upgrades_limit = int(upgrades_limit_raw)
+    except ValueError:
+        return await _rest_response(
+            create_error_response(
+                "Query parameters 'history_limit' and 'upgrades_limit' must be integers.",
+                error_code="INVALID_PARAMS",
+                details={
+                    "history_limit": history_limit_raw,
+                    "upgrades_limit": upgrades_limit_raw,
+                },
+            )
+        )
+
+    return await _rest_response(
+        await get_combined_quote(
+            symbols=symbols,
+            quote_fields=quote_fields,
+            history_limit=history_limit,
+            upgrades_limit=upgrades_limit,
+            no_cache=no_cache,
+        )
+    )
 
 
 @mcp.tool(
@@ -740,7 +1211,7 @@ async def get_top_growth_companies(
     tables = await _gather_industry_tables(industries, "top_growth_companies", expected_sector_key)
 
     results = []
-    for industry_name, df in zip(industries, tables):
+    for industry_name, df in zip(industries, tables, strict=False):
         if df is None or df.empty:
             continue
 
@@ -788,7 +1259,7 @@ async def get_top_performing_companies(
     tables = await _gather_industry_tables(industries, "top_performing_companies", expected_sector_key)
 
     results = []
-    for industry_name, df in zip(industries, tables):
+    for industry_name, df in zip(industries, tables, strict=False):
         if df is None or df.empty:
             continue
 
@@ -1620,7 +2091,11 @@ async def get_combined_quote(
 
     merged: dict = {"results": {}, "summary": {"totalRequested": len(symbols), "totalReturned": 0, "errors": []}}
 
-    all_symbols = set(quote_res.get("results", {}).keys()) | set(analyst_res.get("results", {}).keys()) | set(earnings_res.get("results", {}).keys())
+    all_symbols = (
+        set(quote_res.get("results", {}).keys())
+        | set(analyst_res.get("results", {}).keys())
+        | set(earnings_res.get("results", {}).keys())
+    )
 
     for sym in all_symbols:
         q = quote_res.get("results", {}).get(sym, {})
