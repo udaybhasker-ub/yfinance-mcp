@@ -47,6 +47,18 @@ def test_rest_routes_are_registered() -> None:
     }
 
     assert expected_paths.issubset(paths)
+    assert "/api/routes" in paths
+
+
+@pytest.mark.asyncio
+async def test_api_routes_returns_route_list(rest_client) -> None:
+    response = await rest_client.get("/api/routes")
+    assert response.status_code == 200
+    body = response.json()
+    assert "routes" in body
+    paths = {r["path"] for r in body["routes"]}
+    assert "/quote" in paths
+    assert "/ticker/{symbol}" in paths
 
 
 @pytest.mark.asyncio

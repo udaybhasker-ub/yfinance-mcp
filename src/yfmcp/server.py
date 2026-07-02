@@ -106,6 +106,35 @@ async def health_check(request: Any) -> Any:
     return JSONResponse({"status": "ok", "service": "yfinance-mcp"})
 
 
+_REST_ROUTES = [
+    {"path": "/ticker/{symbol}", "methods": ["GET"], "description": "Full ticker info for a symbol (fundamentals, profile, etc.)"},
+    {"path": "/quote", "methods": ["GET"], "description": "Quote for one or more symbols via ?symbols=A,B,C query param"},
+    {"path": "/quote/{symbol}", "methods": ["GET"], "description": "Quote for a single symbol"},
+    {"path": "/news", "methods": ["GET"], "description": "News for one or more symbols via ?symbols=A,B,C query param"},
+    {"path": "/news/{symbol}", "methods": ["GET"], "description": "News for a single symbol"},
+    {"path": "/search", "methods": ["GET"], "description": "Search for tickers or news via ?query=&search_type="},
+    {"path": "/screen", "methods": ["GET", "POST"], "description": "Screen stocks with a predefined query type"},
+    {"path": "/screen/gappers", "methods": ["GET"], "description": "Screen for today's gap-up/gap-down stocks"},
+    {"path": "/top/{sector}", "methods": ["GET"], "description": "Top tickers in a given sector"},
+    {"path": "/price-history", "methods": ["GET"], "description": "OHLCV price history via ?symbols=&period=&interval="},
+    {"path": "/financials", "methods": ["GET"], "description": "Financial statements (income, balance, cash flow) via ?symbols="},
+    {"path": "/options/{symbol}", "methods": ["GET"], "description": "Option chain for a symbol (calls + puts)"},
+    {"path": "/options/{symbol}/dates", "methods": ["GET"], "description": "Available option expiration dates for a symbol"},
+    {"path": "/holders/{symbol}", "methods": ["GET"], "description": "Institutional and insider holders for a symbol"},
+    {"path": "/earnings", "methods": ["GET"], "description": "Earnings history and estimates via ?symbols="},
+    {"path": "/analyst", "methods": ["GET"], "description": "Analyst recommendations and price targets via ?symbols="},
+    {"path": "/combined-quote", "methods": ["GET"], "description": "Combined quote with extra fields via ?symbols="},
+]
+
+
+@mcp.custom_route("/api/routes", methods=["GET"], name="api_routes", include_in_schema=False)
+async def list_routes(request: Any) -> Any:
+    """Lists all available REST endpoints with descriptions."""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"routes": _REST_ROUTES})
+
+
 _ASSETS_DIR = Path(__file__).parent / "assets"
 _ERROR_HTTP_STATUS = {
     "INVALID_PARAMS": 400,
