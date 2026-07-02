@@ -40,6 +40,7 @@ from yfmcp.quote_fetcher import QuoteFetcher
 from yfmcp.screener import build_screener_query
 from yfmcp.screener import filter_us_currency_quotes
 from yfmcp.screener import truncate_quotes
+from yfmcp.ticker_fetcher import processor as ticker_info_processor
 from yfmcp.types import ChartType
 from yfmcp.types import Interval
 from yfmcp.types import OptionChainType
@@ -109,6 +110,7 @@ async def health_check(request: Any) -> Any:
 
 _REST_ROUTES = [
     {"path": "/ticker/{symbol}", "methods": ["GET"], "description": "Full ticker info for a symbol (fundamentals, profile, etc.)"},
+    {"path": "/ticker", "methods": ["GET"], "description": "Full ticker info for one or more symbols via ?symbols=A,B,C query param"},
     {"path": "/quote", "methods": ["GET"], "description": "Quote for one or more symbols via ?symbols=A,B,C query param"},
     {"path": "/quote/{symbol}", "methods": ["GET"], "description": "Quote for a single symbol"},
     {"path": "/news", "methods": ["GET"], "description": "News for one or more symbols via ?symbols=A,B,C query param"},
@@ -259,6 +261,23 @@ def _protected_custom_route(path: str, methods: list[str], name: str):
 @_protected_custom_route("/ticker/{symbol}", methods=["GET"], name="rest_ticker_info")
 async def rest_get_ticker_info(request: Any) -> Any:
     return await _rest_response(await get_ticker_info(request.path_params["symbol"]))
+
+
+@_protected_custom_route("/ticker", methods=["GET"], name="rest_ticker_info_batch")
+async def rest_get_ticker_info_batch(request: Any) -> Any:
+    symbols = _get_query_list(request, "symbols")
+    no_cache = _get_query_bool(request, "no_cache", False)
+
+    if not symbols:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'symbols' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "symbols"},
+            )
+        )
+
+    return await _rest_response(await get_ticker_info_batch(symbols=symbols, no_cache=no_cache))
 
 
 @_protected_custom_route("/quote", methods=["GET"], name="rest_quote")
@@ -717,6 +736,54 @@ async def get_ticker_info(
                 logger.error("Unable to convert {}: {} to datetime: {}", key, value, exc)
 
     return jq_or_json(info, template)
+
+
+@mcp.tool(
+    name="yfinance_get_ticker_info_batch",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@_logged_tool
+async def get_ticker_info_batch(
+    symbols: Annotated[
+        list[str],
+        Field(
+            description=(
+                "One or more stock ticker symbols, e.g. ['AAPL', 'MSFT']. "
+                "Up to 10 tickers per call. Results cached for 15 minutes."
+            ),
+            min_length=1,
+            max_length=10,
+        ),
+    ],
+    no_cache: Annotated[
+        bool,
+        Field(description="Bypass the 15-minute cache and fetch fresh info. The result is written back to cache."),
+    ] = False,
+    template: _JqTemplate = None,
+) -> str:
+    """Fetch comprehensive ticker info (fundamentals, profile, trading metrics) for one or more tickers.
+
+    Equivalent to ``yfinance_get_ticker_info`` but batched for portfolio-style lookups
+    where you'd otherwise call the single-symbol tool once per position.
+
+    Returns a batched envelope keyed by ticker:
+
+        {
+          "results": {
+            "AAPL": {
+              "data": {"symbol": "AAPL", "longName": "Apple Inc.", "marketCap": ..., ...},
+              "meta": {"fromCache": false, "cacheAge": 0, "warnings": []}
+            }
+          },
+          "summary": {"totalRequested": 1, "totalReturned": 1, "errors": []}
+        }
+    """
+    return jq_or_json(await ticker_info_processor.run(symbols, no_cache=no_cache), template)
 
 
 @mcp.tool(
