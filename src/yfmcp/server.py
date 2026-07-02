@@ -7,6 +7,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Annotated
 from typing import Any
+from typing import get_args
 
 import yfinance as yf
 from loguru import logger
@@ -116,6 +117,7 @@ _REST_ROUTES = [
     {"path": "/screen", "methods": ["GET", "POST"], "description": "Screen stocks with a predefined query type"},
     {"path": "/screen/gappers", "methods": ["GET"], "description": "Screen for today's gap-up/gap-down stocks"},
     {"path": "/top/{sector}", "methods": ["GET"], "description": "Top tickers in a given sector"},
+    {"path": "/top-all", "methods": ["GET"], "description": "Top tickers of a given type across all sectors via ?type=&n="},
     {"path": "/price-history", "methods": ["GET"], "description": "OHLCV price history via ?symbols=&period=&interval="},
     {"path": "/financials", "methods": ["GET"], "description": "Financial statements (income, balance, cash flow) via ?symbols="},
     {"path": "/options/{symbol}", "methods": ["GET"], "description": "Option chain for a symbol (calls + puts)"},
@@ -447,6 +449,39 @@ async def rest_get_top(request: Any) -> Any:
         return await _rest_response(_invalid_query_param_response("n", top_n_raw, "an integer"))
 
     return await _rest_response(await get_top(sector=request.path_params["sector"], top_type=top_type, top_n=top_n))
+
+
+@_protected_custom_route("/top-all", methods=["GET"], name="rest_top_all")
+async def rest_get_top_all(request: Any) -> Any:
+    top_type = request.query_params.get("type")
+    if not top_type:
+        return await _rest_response(
+            create_error_response(
+                "Query parameter 'type' is required.",
+                error_code="INVALID_PARAMS",
+                details={"parameter": "type"},
+            )
+        )
+
+    top_n_raw = request.query_params.get("n", "10")
+    try:
+        top_n = int(top_n_raw)
+    except ValueError:
+        return await _rest_response(_invalid_query_param_response("n", top_n_raw, "an integer"))
+
+    sectors = get_args(Sector)
+    raw_results = await asyncio.gather(
+        *(get_top(sector=sector, top_type=top_type, top_n=top_n) for sector in sectors)
+    )
+
+    result = {}
+    for sector, raw in zip(sectors, raw_results, strict=True):
+        try:
+            result[sector] = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            result[sector] = raw
+
+    return await _rest_response(json.dumps(result))
 
 
 @_protected_custom_route("/price-history", methods=["GET"], name="rest_price_history")
