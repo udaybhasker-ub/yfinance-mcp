@@ -64,12 +64,12 @@ from yfmcp.yf_runner import _select_retryable_exception
 _EQUITY_FILTER_OVERFETCH_FACTOR = 4
 _YAHOO_SCREENER_MAX_SIZE = 250
 _CALENDAR_GET_VALUES = set(get_args(CalendarType))
-_CALENDAR_TYPES: tuple[CalendarType, ...] = ("earnings", "ipo", "splits", "economic_events")
+_CALENDAR_TYPES: tuple[CalendarType, ...] = ("earnings", "ipo", "splits", "economic_event")
 _CALENDAR_SORT_COLUMNS = {
     "earnings": "Event Start Date",
     "ipo": "Date",
     "splits": "Payable On",
-    "economic_events": "Event Time",
+    "economic_event": "Event Time",
 }
 
 # ---------------------------------------------------------------------------
@@ -174,7 +174,7 @@ _REST_ROUTES = [
     {
         "path": "/calendars",
         "methods": ["GET"],
-        "description": "US market calendars via ?get=all|earnings|ipo|splits|economic_events",
+        "description": "US market calendars via ?get=all|earnings|ipo|splits|economic_event",
     },
     {"path": "/combined-quote", "methods": ["GET"], "description": "Combined quote with extra fields via ?symbols="},
 ]
@@ -683,7 +683,7 @@ async def rest_get_analyst(request: Any) -> Any:
 async def rest_get_calendars(request: Any) -> Any:
     calendar_get = request.query_params.get("get", "all")
     if calendar_get not in _CALENDAR_GET_VALUES:
-        expected = "one of: all, earnings, ipo, splits, economic_events"
+        expected = "one of: all, earnings, ipo, splits, economic_event"
         return await _rest_response(_invalid_query_param_response("get", calendar_get, expected))
 
     start = request.query_params.get("start")
@@ -2267,7 +2267,7 @@ def _validate_calendar_args(
             details={"market_cap": market_cap},
         )
 
-    if get in {"ipo", "splits", "economic_events"} and market_cap is not None:
+    if get in {"ipo", "splits", "economic_event"} and market_cap is not None:
         return create_error_response(
             "market_cap is only supported for earnings calendars or get='all'.",
             error_code="INVALID_PARAMS",
@@ -2326,7 +2326,7 @@ async def get_calendars(
         Field(
             description=(
                 "Which US market calendar data to fetch: 'all', 'earnings', 'ipo', "
-                "'splits', or 'economic_events'. Default 'all'."
+                "'splits', or 'economic_event'. Default 'all'."
             )
         ),
     ] = "all",

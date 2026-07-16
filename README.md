@@ -298,7 +298,7 @@ Fetch US market/financial calendar events from Yahoo Finance, sorted by event da
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `get` | string | No | `"all"`, `"earnings"`, `"ipo"`, `"splits"`, or `"economic_events"` (default: `"all"`) |
+| `get` | string | No | `"all"`, `"earnings"`, `"ipo"`, `"splits"`, or `"economic_event"` (default: `"all"`) |
 | `start` | string | No | Start date, e.g. `"2025-11-08"` |
 | `end` | string | No | End date, e.g. `"2025-11-15"` |
 | `limit` | number | No | Maximum number of results to return, `1-100` (default: `12`) |

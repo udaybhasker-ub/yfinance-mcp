@@ -21,7 +21,7 @@ CalendarType = Literal[
     "earnings",
     "ipo",
     "splits",
-    "economic_events",
+    "economic_event",
 ]
 
 

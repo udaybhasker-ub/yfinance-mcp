@@ -471,7 +471,7 @@ async def test_get_calendars_all_returns_merged_results_sorted_by_datetime(
     }
     assert payload["summary"]["totalReturned"] == 5
     assert [row["calendar_type"] for row in rows] == [
-        "economic_events",
+        "economic_event",
         "earnings",
         "ipo",
         "earnings",
