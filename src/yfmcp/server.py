@@ -2,13 +2,16 @@ import asyncio
 import base64
 import json
 import os
+from contextlib import suppress
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Annotated
 from typing import Any
+from typing import cast
 from typing import get_args
 
+import pandas as pd
 import yfinance as yf
 from loguru import logger
 from mcp.server.auth.settings import AuthSettings
@@ -41,6 +44,7 @@ from yfmcp.screener import build_screener_query
 from yfmcp.screener import filter_us_currency_quotes
 from yfmcp.screener import truncate_quotes
 from yfmcp.ticker_fetcher import processor as ticker_info_processor
+from yfmcp.types import CalendarType
 from yfmcp.types import ChartType
 from yfmcp.types import Interval
 from yfmcp.types import OptionChainType
@@ -59,6 +63,14 @@ from yfmcp.yf_runner import _select_retryable_exception
 
 _EQUITY_FILTER_OVERFETCH_FACTOR = 4
 _YAHOO_SCREENER_MAX_SIZE = 250
+_CALENDAR_GET_VALUES = set(get_args(CalendarType))
+_CALENDAR_TYPES: tuple[CalendarType, ...] = ("earnings", "ipo", "splits", "economic_events")
+_CALENDAR_SORT_COLUMNS = {
+    "earnings": "Event Start Date",
+    "ipo": "Date",
+    "splits": "Payable On",
+    "economic_events": "Event Time",
+}
 
 # ---------------------------------------------------------------------------
 # Reusable Annotated type aliases for jq template parameters.
@@ -109,24 +121,61 @@ async def health_check(request: Any) -> Any:
 
 
 _REST_ROUTES = [
-    {"path": "/ticker/{symbol}", "methods": ["GET"], "description": "Full ticker info for a symbol (fundamentals, profile, etc.)"},
-    {"path": "/ticker", "methods": ["GET"], "description": "Full ticker info for one or more symbols via ?symbols=A,B,C query param"},
-    {"path": "/quote", "methods": ["GET"], "description": "Quote for one or more symbols via ?symbols=A,B,C query param"},
+    {
+        "path": "/ticker/{symbol}",
+        "methods": ["GET"],
+        "description": "Full ticker info for a symbol (fundamentals, profile, etc.)",
+    },
+    {
+        "path": "/ticker",
+        "methods": ["GET"],
+        "description": "Full ticker info for one or more symbols via ?symbols=A,B,C query param",
+    },
+    {
+        "path": "/quote",
+        "methods": ["GET"],
+        "description": "Quote for one or more symbols via ?symbols=A,B,C query param",
+    },
     {"path": "/quote/{symbol}", "methods": ["GET"], "description": "Quote for a single symbol"},
-    {"path": "/news", "methods": ["GET"], "description": "News for one or more symbols via ?symbols=A,B,C query param"},
+    {
+        "path": "/news",
+        "methods": ["GET"],
+        "description": "News for one or more symbols via ?symbols=A,B,C query param",
+    },
     {"path": "/news/{symbol}", "methods": ["GET"], "description": "News for a single symbol"},
     {"path": "/search", "methods": ["GET"], "description": "Search for tickers or news via ?query=&search_type="},
     {"path": "/screen", "methods": ["GET", "POST"], "description": "Screen stocks with a predefined query type"},
     {"path": "/screen/gappers", "methods": ["GET"], "description": "Screen for today's gap-up/gap-down stocks"},
     {"path": "/top/{sector}", "methods": ["GET"], "description": "Top tickers in a given sector"},
-    {"path": "/top-all", "methods": ["GET"], "description": "Top tickers of a given type across all sectors via ?type=&n="},
-    {"path": "/price-history", "methods": ["GET"], "description": "OHLCV price history via ?symbols=&period=&interval="},
-    {"path": "/financials", "methods": ["GET"], "description": "Financial statements (income, balance, cash flow) via ?symbols="},
+    {
+        "path": "/top-all",
+        "methods": ["GET"],
+        "description": "Top tickers of a given type across all sectors via ?type=&n=",
+    },
+    {
+        "path": "/price-history",
+        "methods": ["GET"],
+        "description": "OHLCV price history via ?symbols=&period=&interval=",
+    },
+    {
+        "path": "/financials",
+        "methods": ["GET"],
+        "description": "Financial statements (income, balance, cash flow) via ?symbols=",
+    },
     {"path": "/options/{symbol}", "methods": ["GET"], "description": "Option chain for a symbol (calls + puts)"},
-    {"path": "/options/{symbol}/dates", "methods": ["GET"], "description": "Available option expiration dates for a symbol"},
+    {
+        "path": "/options/{symbol}/dates",
+        "methods": ["GET"],
+        "description": "Available option expiration dates for a symbol",
+    },
     {"path": "/holders/{symbol}", "methods": ["GET"], "description": "Institutional and insider holders for a symbol"},
     {"path": "/earnings", "methods": ["GET"], "description": "Earnings history and estimates via ?symbols="},
     {"path": "/analyst", "methods": ["GET"], "description": "Analyst recommendations and price targets via ?symbols="},
+    {
+        "path": "/calendars",
+        "methods": ["GET"],
+        "description": "US market calendars via ?get=all|earnings|ipo|splits|economic_events",
+    },
     {"path": "/combined-quote", "methods": ["GET"], "description": "Combined quote with extra fields via ?symbols="},
 ]
 
@@ -628,6 +677,16 @@ async def rest_get_analyst(request: Any) -> Any:
     return await _rest_response(
         await get_analyst(symbols=symbols, upgrades_limit=upgrades_limit, no_cache=no_cache)
     )
+
+
+@_protected_custom_route("/calendars", methods=["GET"], name="rest_calendars")
+async def rest_get_calendars(request: Any) -> Any:
+    calendar_get = request.query_params.get("get", "all")
+    if calendar_get not in _CALENDAR_GET_VALUES:
+        expected = "one of: all, earnings, ipo, splits, economic_events"
+        return await _rest_response(_invalid_query_param_response("get", calendar_get, expected))
+
+    return await _rest_response(await get_calendars(get=cast(CalendarType, calendar_get)))
 
 
 @_protected_custom_route("/combined-quote", methods=["GET"], name="rest_combined_quote")
@@ -2100,6 +2159,128 @@ async def get_analyst(
     Useful for watchlist-wide consensus sweeps. Results cached for 1 hour.
     """
     return jq_or_json(await analyst_processor.run(symbols, no_cache=no_cache, upgrades_limit=upgrades_limit), template)
+
+
+def _calendar_record_value(value: Any) -> Any:
+    if isinstance(value, pd.Timestamp | datetime):
+        return value.isoformat()
+
+    if hasattr(value, "item") and callable(value.item):
+        with suppress(Exception):
+            value = value.item()
+
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+
+    return value
+
+
+def _calendar_dataframe_to_records(calendar_type: CalendarType, df: pd.DataFrame) -> list[dict[str, Any]]:
+    if calendar_type == "all":
+        return []
+
+    if df.empty:
+        return []
+
+    sort_column = _CALENDAR_SORT_COLUMNS[calendar_type]
+    ordered_df = df.sort_values(by=sort_column, kind="stable") if sort_column in df.columns else df
+    records: list[dict[str, Any]] = []
+
+    for row in ordered_df.reset_index().to_dict(orient="records"):
+        normalized = {key: _calendar_record_value(value) for key, value in row.items()}
+        normalized["calendar_type"] = calendar_type
+        normalized["date_time"] = normalized.get(sort_column)
+        records.append(normalized)
+
+    return records
+
+
+async def _fetch_calendar_dataframe(calendar_type: CalendarType) -> pd.DataFrame:
+    if calendar_type == "all":
+        return pd.DataFrame()
+
+    calendars = await asyncio.to_thread(yf.Calendars)
+
+    if calendar_type == "earnings":
+        return await asyncio.to_thread(calendars.get_earnings_calendar)
+    if calendar_type == "ipo":
+        return await asyncio.to_thread(calendars.get_ipo_info_calendar)
+    if calendar_type == "splits":
+        return await asyncio.to_thread(calendars.get_splits_calendar)
+    return await asyncio.to_thread(calendars.get_economic_events_calendar)
+
+
+@mcp.tool(
+    name="yfinance_get_calendars",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@_logged_tool
+async def get_calendars(
+    get: Annotated[
+        CalendarType,
+        Field(
+            description=(
+                "Which US market calendar data to fetch: 'all', 'earnings', 'ipo', "
+                "'splits', or 'economic_events'. Default 'all'."
+            )
+        ),
+    ] = "all",
+    template: _JqTemplate = None,
+) -> str:
+    """Fetch US market and financial calendars from Yahoo Finance, ordered by event date/time.
+
+    Returns:
+    - For `get='all'`: a single merged list of calendar events across earnings, IPOs, splits,
+      and economic events, sorted ascending by date/time.
+    - For a specific calendar type: only that category's events, also sorted ascending.
+    """
+    calendar_types = _CALENDAR_TYPES if get == "all" else (get,)
+    counts: dict[str, int] = {}
+    results: list[dict[str, Any]] = []
+
+    try:
+        for calendar_type in calendar_types:
+            df = await _fetch_calendar_dataframe(calendar_type)
+            records = _calendar_dataframe_to_records(calendar_type, df)
+            counts[calendar_type] = len(records)
+            results.extend(records)
+    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
+        return _create_retryable_error_response(f"fetching '{get}' calendar data", exc, {"get": get})
+    except Exception as exc:
+        return create_error_response(
+            f"Failed to fetch '{get}' calendar data from Yahoo Finance.",
+            error_code="API_ERROR",
+            details={"get": get, "exception": str(exc)},
+        )
+
+    results.sort(key=lambda item: (item.get("date_time") is None, str(item.get("date_time") or "")))
+
+    if not results:
+        return create_error_response(
+            f"No calendar data available for '{get}'.",
+            error_code="NO_DATA",
+            details={"get": get},
+        )
+
+    return jq_or_json(
+        {
+            "get": get,
+            "results": results,
+            "summary": {
+                "totalReturned": len(results),
+                "counts": counts,
+            },
+        },
+        template,
+    )
 
 
 @mcp.tool(

@@ -292,6 +292,21 @@ Fetch analyst consensus breakdown, price targets, and upgrade/downgrade history 
 - **`recommendations`** — Period-by-period breakdown with strongBuy, buy, hold, sell, strongSell counts. Most recent period reflects current analyst consensus
 - **`upgrades_downgrades`** — Firm-level grade changes with firm name, fromGrade, toGrade, and action (up/down/init/reit)
 
+### `yfinance_get_calendars`
+
+Fetch US market/financial calendar events from Yahoo Finance, sorted by event date/time ascending.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `get` | string | No | `"all"`, `"earnings"`, `"ipo"`, `"splits"`, or `"economic_events"` (default: `"all"`) |
+
+**Returns:** JSON object with:
+- `get` — The requested calendar group
+- `results` — A merged event list, each row tagged with `calendar_type` and normalized `date_time`
+- `summary.counts` — Per-calendar counts for the fetched categories
+
+When `get="all"`, the response merges earnings, IPO, split, and economic event calendars into one timeline.
+
 ## Usage
 
 ### Via uv (recommended)

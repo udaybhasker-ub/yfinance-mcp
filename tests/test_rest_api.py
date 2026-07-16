@@ -43,6 +43,7 @@ def test_rest_routes_are_registered() -> None:
         "/holders/{symbol}",
         "/earnings",
         "/analyst",
+        "/calendars",
         "/combined-quote",
     }
 
@@ -59,6 +60,7 @@ async def test_api_routes_returns_route_list(rest_client) -> None:
     paths = {r["path"] for r in body["routes"]}
     assert "/quote" in paths
     assert "/ticker/{symbol}" in paths
+    assert "/calendars" in paths
 
 
 @pytest.mark.asyncio
@@ -208,3 +210,30 @@ async def test_earnings_route_preserves_nan_json_values(
     earnings_row = payload["results"]["AAPL"]["data"]["earnings_dates"]["2026-07-30 16:00 EDT"]
     assert math.isnan(earnings_row["Reported EPS"])
     assert math.isnan(earnings_row["Surprise(%)"])
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.get_calendars", new_callable=AsyncMock)
+async def test_calendars_route_defaults_to_all(
+    mock_get_calendars: AsyncMock, rest_client: httpx.AsyncClient
+) -> None:
+    mock_get_calendars.return_value = (
+        '{"get":"all","results":[{"calendar_type":"earnings","date_time":"2026-07-15T08:30:00"}],'
+        '"summary":{"totalReturned":1,"counts":{"earnings":1}}}'
+    )
+
+    response = await rest_client.get("/calendars")
+
+    assert response.status_code == 200
+    assert response.json()["get"] == "all"
+    mock_get_calendars.assert_awaited_once_with(get="all")
+
+
+@pytest.mark.asyncio
+async def test_calendars_route_rejects_invalid_get(rest_client: httpx.AsyncClient) -> None:
+    response = await rest_client.get("/calendars", params={"get": "dividends"})
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["error_code"] == "INVALID_PARAMS"
+    assert payload["details"]["parameter"] == "get"

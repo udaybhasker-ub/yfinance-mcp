@@ -16,6 +16,14 @@ SearchType = Literal[
     "news",
 ]
 
+CalendarType = Literal[
+    "all",
+    "earnings",
+    "ipo",
+    "splits",
+    "economic_events",
+]
+
 
 TopType = Literal[
     "top_etfs",

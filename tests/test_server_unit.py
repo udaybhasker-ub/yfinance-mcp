@@ -20,6 +20,8 @@ from yfmcp.news_fetcher import _cache as news_cache
 from yfmcp.price_history_fetcher import _cache as price_history_cache
 from yfmcp.quote_fetcher import _quote_cache
 from yfmcp.server import _sector_key
+from yfmcp.server import get_calendars
+from yfmcp.server import get_combined_quote
 from yfmcp.server import get_financials
 from yfmcp.server import get_holders
 from yfmcp.server import get_option_chain
@@ -30,7 +32,6 @@ from yfmcp.server import get_top_etfs
 from yfmcp.server import get_top_growth_companies
 from yfmcp.server import get_top_mutual_funds
 from yfmcp.server import get_top_performing_companies
-from yfmcp.server import get_combined_quote
 from yfmcp.server import screen
 from yfmcp.server import screen_gappers
 from yfmcp.yf_runner import _ticker_cache
@@ -404,6 +405,93 @@ async def test_get_price_history_api_error_surfaces_in_envelope(
     assert len(errors) == 1
     assert errors[0]["symbol"] == "AAPL"
     assert "history failed" in errors[0]["error"]
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.yf.Calendars")
+@patch("yfmcp.server.asyncio.to_thread")
+async def test_get_calendars_all_returns_merged_results_sorted_by_datetime(
+    mock_to_thread: AsyncMock, mock_calendars: MagicMock
+) -> None:
+    mock_calendars_obj = MagicMock()
+    mock_calendars_obj.get_earnings_calendar.return_value = pd.DataFrame(
+        [
+            {"Symbol": "MSFT", "Event Start Date": pd.Timestamp("2026-07-18 16:00:00"), "Company": "Microsoft"},
+            {"Symbol": "AAPL", "Event Start Date": pd.Timestamp("2026-07-16 08:30:00"), "Company": "Apple"},
+        ]
+    ).set_index("Symbol")
+    mock_calendars_obj.get_ipo_info_calendar.return_value = pd.DataFrame(
+        [
+            {"Symbol": "FIG", "Date": pd.Timestamp("2026-07-17 09:00:00"), "Company": "Fig Corp"},
+        ]
+    ).set_index("Symbol")
+    mock_calendars_obj.get_splits_calendar.return_value = pd.DataFrame(
+        [
+            {"Symbol": "TSLA", "Payable On": pd.Timestamp("2026-07-19 00:00:00"), "Company": "Tesla"},
+        ]
+    ).set_index("Symbol")
+    mock_calendars_obj.get_economic_events_calendar.return_value = pd.DataFrame(
+        [
+            {"Event": "CPI", "Event Time": pd.Timestamp("2026-07-15 07:30:00"), "Region": "US"},
+        ]
+    ).set_index("Event")
+
+    async def mock_thread_func(func, *args, **kwargs):
+        if func is mock_calendars:
+            return mock_calendars_obj
+        if callable(func):
+            return func(*args, **kwargs)
+        return func
+
+    mock_to_thread.side_effect = mock_thread_func
+    mock_calendars.return_value = mock_calendars_obj
+
+    result = await get_calendars("all")
+    payload = json.loads(result)
+    rows = payload["results"]
+
+    assert payload["get"] == "all"
+    assert payload["summary"]["totalReturned"] == 5
+    assert [row["calendar_type"] for row in rows] == [
+        "economic_events",
+        "earnings",
+        "ipo",
+        "earnings",
+        "splits",
+    ]
+    assert [row["date_time"] for row in rows] == [
+        "2026-07-15T07:30:00",
+        "2026-07-16T08:30:00",
+        "2026-07-17T09:00:00",
+        "2026-07-18T16:00:00",
+        "2026-07-19T00:00:00",
+    ]
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.yf.Calendars")
+@patch("yfmcp.server.asyncio.to_thread")
+async def test_get_calendars_specific_category_returns_no_data_error(
+    mock_to_thread: AsyncMock, mock_calendars: MagicMock
+) -> None:
+    mock_calendars_obj = MagicMock()
+    mock_calendars_obj.get_splits_calendar.return_value = pd.DataFrame()
+
+    async def mock_thread_func(func, *args, **kwargs):
+        if func is mock_calendars:
+            return mock_calendars_obj
+        if callable(func):
+            return func(*args, **kwargs)
+        return func
+
+    mock_to_thread.side_effect = mock_thread_func
+    mock_calendars.return_value = mock_calendars_obj
+
+    result = await get_calendars("splits")
+    payload = json.loads(result)
+
+    assert payload["error_code"] == "NO_DATA"
+    assert payload["details"]["get"] == "splits"
 
 
 @pytest.mark.asyncio
