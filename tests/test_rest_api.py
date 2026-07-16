@@ -226,7 +226,16 @@ async def test_calendars_route_defaults_to_all(
 
     assert response.status_code == 200
     assert response.json()["get"] == "all"
-    mock_get_calendars.assert_awaited_once_with(get="all")
+    mock_get_calendars.assert_awaited_once_with(
+        get="all",
+        start=None,
+        end=None,
+        limit=12,
+        offset=0,
+        force=False,
+        market_cap=None,
+        filter_most_active=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -237,3 +246,46 @@ async def test_calendars_route_rejects_invalid_get(rest_client: httpx.AsyncClien
     payload = response.json()
     assert payload["error_code"] == "INVALID_PARAMS"
     assert payload["details"]["parameter"] == "get"
+
+
+@pytest.mark.asyncio
+@patch("yfmcp.server.get_calendars", new_callable=AsyncMock)
+async def test_calendars_route_passes_full_argument_set(
+    mock_get_calendars: AsyncMock, rest_client: httpx.AsyncClient
+) -> None:
+    mock_get_calendars.return_value = '{"get":"earnings","results":[],"summary":{"totalReturned":0,"counts":{}}}'
+
+    await rest_client.get(
+        "/calendars",
+        params={
+            "get": "earnings",
+            "start": "2026-07-01",
+            "end": "2026-07-31",
+            "limit": "25",
+            "offset": "10",
+            "force": "true",
+            "market_cap": "1000000000",
+            "filter_most_active": "false",
+        },
+    )
+
+    mock_get_calendars.assert_awaited_once_with(
+        get="earnings",
+        start="2026-07-01",
+        end="2026-07-31",
+        limit=25,
+        offset=10,
+        force=True,
+        market_cap=1000000000.0,
+        filter_most_active=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_calendars_route_rejects_invalid_market_cap(rest_client: httpx.AsyncClient) -> None:
+    response = await rest_client.get("/calendars", params={"market_cap": "big"})
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["error_code"] == "INVALID_PARAMS"
+    assert payload["details"]["parameter"] == "market_cap"

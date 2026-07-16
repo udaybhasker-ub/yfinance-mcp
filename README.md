@@ -299,13 +299,22 @@ Fetch US market/financial calendar events from Yahoo Finance, sorted by event da
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `get` | string | No | `"all"`, `"earnings"`, `"ipo"`, `"splits"`, or `"economic_events"` (default: `"all"`) |
+| `start` | string | No | Start date, e.g. `"2025-11-08"` |
+| `end` | string | No | End date, e.g. `"2025-11-15"` |
+| `limit` | number | No | Maximum number of results to return, `1-100` (default: `12`) |
+| `offset` | number | No | Pagination offset (default: `0`) |
+| `force` | boolean | No | Re-query even if the underlying yfinance calendar instance already has cached data (default: `false`) |
+| `market_cap` | number | No | Earnings only: minimum USD market cap cutoff. Also applied to the earnings portion of `get="all"` |
+| `filter_most_active` | boolean | No | Earnings only: filter to actively traded stocks. Also applied to the earnings portion of `get="all"` (default: `true`) |
 
 **Returns:** JSON object with:
 - `get` — The requested calendar group
+- `params` — The normalized arguments used for the fetch
 - `results` — A merged event list, each row tagged with `calendar_type` and normalized `date_time`
 - `summary.counts` — Per-calendar counts for the fetched categories
 
 When `get="all"`, the response merges earnings, IPO, split, and economic event calendars into one timeline.
+Per the upstream `yfinance.Calendars` API, `market_cap` and `filter_most_active` apply only to earnings.
 
 ## Usage
 

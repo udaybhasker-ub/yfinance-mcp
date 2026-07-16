@@ -686,7 +686,49 @@ async def rest_get_calendars(request: Any) -> Any:
         expected = "one of: all, earnings, ipo, splits, economic_events"
         return await _rest_response(_invalid_query_param_response("get", calendar_get, expected))
 
-    return await _rest_response(await get_calendars(get=cast(CalendarType, calendar_get)))
+    start = request.query_params.get("start")
+    end = request.query_params.get("end")
+    limit_raw = request.query_params.get("limit", "12")
+    offset_raw = request.query_params.get("offset", "0")
+
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        return await _rest_response(_invalid_query_param_response("limit", limit_raw, "an integer from 1 to 100"))
+
+    try:
+        offset = int(offset_raw)
+    except ValueError:
+        return await _rest_response(_invalid_query_param_response("offset", offset_raw, "an integer >= 0"))
+
+    try:
+        force = _get_query_bool(request, "force", False)
+        filter_most_active = _get_query_bool(request, "filter_most_active", True)
+    except ValueError as exc:
+        return await _rest_response(create_error_response(str(exc), error_code="INVALID_PARAMS"))
+
+    market_cap_raw = request.query_params.get("market_cap")
+    market_cap: float | None = None
+    if market_cap_raw is not None:
+        try:
+            market_cap = float(market_cap_raw)
+        except ValueError:
+            return await _rest_response(
+                _invalid_query_param_response("market_cap", market_cap_raw, "a number representing USD market cap")
+            )
+
+    return await _rest_response(
+        await get_calendars(
+            get=cast(CalendarType, calendar_get),
+            start=start,
+            end=end,
+            limit=limit,
+            offset=offset,
+            force=force,
+            market_cap=market_cap,
+            filter_most_active=filter_most_active,
+        )
+    )
 
 
 @_protected_custom_route("/combined-quote", methods=["GET"], name="rest_combined_quote")
@@ -2198,19 +2240,74 @@ def _calendar_dataframe_to_records(calendar_type: CalendarType, df: pd.DataFrame
     return records
 
 
-async def _fetch_calendar_dataframe(calendar_type: CalendarType) -> pd.DataFrame:
+def _validate_calendar_args(
+    get: CalendarType,
+    limit: int,
+    offset: int,
+    market_cap: float | None,
+) -> str | None:
+    if limit < 1 or limit > 100:
+        return create_error_response(
+            "limit must be between 1 and 100.",
+            error_code="INVALID_PARAMS",
+            details={"limit": limit},
+        )
+
+    if offset < 0:
+        return create_error_response(
+            "offset must be greater than or equal to 0.",
+            error_code="INVALID_PARAMS",
+            details={"offset": offset},
+        )
+
+    if market_cap is not None and market_cap < 0:
+        return create_error_response(
+            "market_cap must be greater than or equal to 0.",
+            error_code="INVALID_PARAMS",
+            details={"market_cap": market_cap},
+        )
+
+    if get in {"ipo", "splits", "economic_events"} and market_cap is not None:
+        return create_error_response(
+            "market_cap is only supported for earnings calendars or get='all'.",
+            error_code="INVALID_PARAMS",
+            details={"get": get, "market_cap": market_cap},
+        )
+
+    return None
+
+
+async def _fetch_calendar_dataframe(
+    calendar_type: CalendarType,
+    start: str | None,
+    end: str | None,
+    limit: int,
+    offset: int,
+    force: bool,
+    market_cap: float | None,
+    filter_most_active: bool,
+) -> pd.DataFrame:
     if calendar_type == "all":
         return pd.DataFrame()
 
-    calendars = await asyncio.to_thread(yf.Calendars)
+    calendars = await asyncio.to_thread(yf.Calendars, start, end)
 
     if calendar_type == "earnings":
-        return await asyncio.to_thread(calendars.get_earnings_calendar)
+        return await asyncio.to_thread(
+            calendars.get_earnings_calendar,
+            market_cap,
+            filter_most_active,
+            start,
+            end,
+            limit,
+            offset,
+            force,
+        )
     if calendar_type == "ipo":
-        return await asyncio.to_thread(calendars.get_ipo_info_calendar)
+        return await asyncio.to_thread(calendars.get_ipo_info_calendar, start, end, limit, offset, force)
     if calendar_type == "splits":
-        return await asyncio.to_thread(calendars.get_splits_calendar)
-    return await asyncio.to_thread(calendars.get_economic_events_calendar)
+        return await asyncio.to_thread(calendars.get_splits_calendar, start, end, limit, offset, force)
+    return await asyncio.to_thread(calendars.get_economic_events_calendar, start, end, limit, offset, force)
 
 
 @mcp.tool(
@@ -2233,6 +2330,36 @@ async def get_calendars(
             )
         ),
     ] = "all",
+    start: Annotated[
+        str | None,
+        Field(description="Start date passed through to yfinance.Calendars / getter methods, e.g. '2025-11-08'."),
+    ] = None,
+    end: Annotated[
+        str | None,
+        Field(description="End date passed through to yfinance.Calendars / getter methods, e.g. '2025-11-15'."),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(description="Maximum number of results to return. yfinance caps this at 100.", ge=1, le=100),
+    ] = 12,
+    offset: Annotated[
+        int,
+        Field(description="Pagination offset passed through to the calendar getter.", ge=0),
+    ] = 0,
+    force: Annotated[
+        bool,
+        Field(description="If true, re-query even if the yfinance calendar instance already has cached data."),
+    ] = False,
+    market_cap: Annotated[
+        float | None,
+        Field(
+            description="Earnings only: minimum market cap in USD. Also applied to the earnings portion of get='all'."
+        ),
+    ] = None,
+    filter_most_active: Annotated[
+        bool,
+        Field(description="Earnings only: filter to actively traded stocks. Also applied to earnings in get='all'."),
+    ] = True,
     template: _JqTemplate = None,
 ) -> str:
     """Fetch US market and financial calendars from Yahoo Finance, ordered by event date/time.
@@ -2242,13 +2369,26 @@ async def get_calendars(
       and economic events, sorted ascending by date/time.
     - For a specific calendar type: only that category's events, also sorted ascending.
     """
+    invalid_args = _validate_calendar_args(get, limit, offset, market_cap)
+    if invalid_args is not None:
+        return invalid_args
+
     calendar_types = _CALENDAR_TYPES if get == "all" else (get,)
     counts: dict[str, int] = {}
     results: list[dict[str, Any]] = []
 
     try:
         for calendar_type in calendar_types:
-            df = await _fetch_calendar_dataframe(calendar_type)
+            df = await _fetch_calendar_dataframe(
+                calendar_type=calendar_type,
+                start=start,
+                end=end,
+                limit=limit,
+                offset=offset,
+                force=force,
+                market_cap=market_cap,
+                filter_most_active=filter_most_active,
+            )
             records = _calendar_dataframe_to_records(calendar_type, df)
             counts[calendar_type] = len(records)
             results.extend(records)
@@ -2273,6 +2413,15 @@ async def get_calendars(
     return jq_or_json(
         {
             "get": get,
+            "params": {
+                "start": start,
+                "end": end,
+                "limit": limit,
+                "offset": offset,
+                "force": force,
+                "market_cap": market_cap,
+                "filter_most_active": filter_most_active,
+            },
             "results": results,
             "summary": {
                 "totalReturned": len(results),

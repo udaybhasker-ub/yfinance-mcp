@@ -446,11 +446,29 @@ async def test_get_calendars_all_returns_merged_results_sorted_by_datetime(
     mock_to_thread.side_effect = mock_thread_func
     mock_calendars.return_value = mock_calendars_obj
 
-    result = await get_calendars("all")
+    result = await get_calendars(
+        "all",
+        start="2026-07-01",
+        end="2026-07-31",
+        limit=25,
+        offset=10,
+        force=True,
+        market_cap=1_000_000_000.0,
+        filter_most_active=False,
+    )
     payload = json.loads(result)
     rows = payload["results"]
 
     assert payload["get"] == "all"
+    assert payload["params"] == {
+        "start": "2026-07-01",
+        "end": "2026-07-31",
+        "limit": 25,
+        "offset": 10,
+        "force": True,
+        "market_cap": 1_000_000_000.0,
+        "filter_most_active": False,
+    }
     assert payload["summary"]["totalReturned"] == 5
     assert [row["calendar_type"] for row in rows] == [
         "economic_events",
@@ -466,6 +484,17 @@ async def test_get_calendars_all_returns_merged_results_sorted_by_datetime(
         "2026-07-18T16:00:00",
         "2026-07-19T00:00:00",
     ]
+    assert mock_to_thread.await_args_list[0].args == (mock_calendars, "2026-07-01", "2026-07-31")
+    assert mock_to_thread.await_args_list[1].args == (
+        mock_calendars_obj.get_earnings_calendar,
+        1_000_000_000.0,
+        False,
+        "2026-07-01",
+        "2026-07-31",
+        25,
+        10,
+        True,
+    )
 
 
 @pytest.mark.asyncio
@@ -492,6 +521,24 @@ async def test_get_calendars_specific_category_returns_no_data_error(
 
     assert payload["error_code"] == "NO_DATA"
     assert payload["details"]["get"] == "splits"
+
+
+@pytest.mark.asyncio
+async def test_get_calendars_rejects_earnings_only_args_for_non_earnings_calendar() -> None:
+    result = await get_calendars("ipo", market_cap=1_000_000.0)
+    payload = json.loads(result)
+
+    assert payload["error_code"] == "INVALID_PARAMS"
+    assert payload["details"]["get"] == "ipo"
+
+
+@pytest.mark.asyncio
+async def test_get_calendars_rejects_invalid_limit() -> None:
+    result = await get_calendars("all", limit=101)
+    payload = json.loads(result)
+
+    assert payload["error_code"] == "INVALID_PARAMS"
+    assert payload["details"]["limit"] == 101
 
 
 @pytest.mark.asyncio
