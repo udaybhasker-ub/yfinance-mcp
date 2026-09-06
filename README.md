@@ -9,10 +9,6 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that provides AI assistants with access to Yahoo Finance data via [yfinance](https://github.com/ranaroussi/yfinance). Query stock information, financial news, sector rankings, and generate professional financial charts — all from your AI chat.
 
-<a href="https://glama.ai/mcp/servers/@narumiruna/yfinance-mcp">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/@narumiruna/yfinance-mcp/badge" />
-</a>
-
 ## Features
 
 - **Stock Data** — Company info, financials, valuation metrics, dividends, and trading data
